@@ -2,6 +2,7 @@
 
 - [PiperCapture](PiperCapture/README.md)：主从机械臂示教采集，三视角预览、RGB/action 同步、MP4/CSV/JSONL、LeRobot 导出。
 - [PiperX_Teleop](PiperX_Teleop/README.md)：Quest 3 双臂遥操，支持 USB / Wi-Fi。
+- [HumanCapture](HumanCapture/README.md)：人类示范三相机同步采集，白色界面、实时预览、任务序号、MP4 与逐帧时间戳。
 
 ## 采集
 
