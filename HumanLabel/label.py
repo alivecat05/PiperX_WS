@@ -1,4 +1,4 @@
-"""Head wrist poses + synchronized wrist-camera pinch refinement with MediaPipe."""
+"""Head wrist poses + synchronized pinch refinement, with MediaPipe or WiLoR/MANO."""
 import argparse
 from contextlib import ExitStack
 import csv
@@ -6,6 +6,7 @@ from importlib.metadata import version
 import json
 from pathlib import Path
 import urllib.request
+import time
 
 import cv2
 import numpy as np
@@ -19,6 +20,10 @@ HEADER = ["timestamp_unix_s", *VECTOR_NAMES]
 MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
              "hand_landmarker/float16/1/hand_landmarker.task")
 REVISION = "wrist_origin_with_wrist_camera_pinch"
+
+
+def pipeline_revision(args):
+    return REVISION + ("_mano_root_perspective_v2" if getattr(args, "backend", "mediapipe") == "mano" else "")
 
 
 def camera_model(width, height, path=None):
@@ -139,7 +144,8 @@ def fuse_pinch(head, wrist, side, args):
     """Refine a scalar distance only; never mix positions from different cameras."""
     # Own hand lies near the bottom of a camera mounted on that wrist. Require
     # both full finger chains inside the real image, not just two hallucinated tips.
-    supported = bool(wrist["pinch_valid"] and wrist["inside"][1:9].all()
+    required = [3, 4, 7, 8] if "mano" in wrist and head["pinch_valid"] else list(range(1, 9))
+    supported = bool(wrist["pinch_valid"] and wrist["inside"][required].all()
                      and wrist["pixels"][0, 1] >= wrist["image_height"] * .55)
     if not supported:
         return head["distance"], "head" if head["pinch_valid"] else "none", "wrist_unavailable"
@@ -175,8 +181,10 @@ def draw(frame, hand, vector, distance, side, matrix, distortion, source):
                 (20, 65 if side == "left" else 95), cv2.FONT_HERSHEY_SIMPLEX, .65, color, 2)
 
 
-def process(episode, output, model, args):
-    import mediapipe as mp
+def process(episode, output, model, args, predictor=None):
+    mano_mode = getattr(args, "backend", "mediapipe") == "mano"
+    if not mano_mode:
+        import mediapipe as mp
 
     manifest = json.loads((episode / "manifest.json").read_text(encoding="utf-8"))
     if manifest.get("schema") != "human_capture.rgb.v1":
@@ -184,20 +192,36 @@ def process(episode, output, model, args):
     if manifest.get("simulated"):
         print(f"Skip simulated video: {episode}", flush=True)
         return
+    started = time.perf_counter()
     output.mkdir(parents=True, exist_ok=False)  # Never replace an existing label run.
-    meta = {"schema": "human_label.camera_pseudo_action.v1", "pipeline_revision": REVISION, "status": "processing",
+    meta = {"schema": "human_label.camera_pseudo_action.v1", "pipeline_revision": pipeline_revision(args), "status": "processing",
             "source": str(episode), "source_status": manifest["status"], "task": manifest["task"],
             "robot_base_calibrated": False, "action_semantics": "same-frame estimated human WRIST pose + refined pinch width; NOT robot commands",
             "vector_names": VECTOR_NAMES, "reference_frame": "fixed_head_color_optical", "camera_fixed": True,
             "pose_convention": "T_C_W; origin=WRIST landmark #0; right-handed; head camera +x right +y down +z forward; meters; quaternion xyzw",
             "tool_convention": "origin=P0; +z=WRIST->MIDDLE_MCP; +x=orthogonalized PINKY_MCP->INDEX_MCP; +y=z cross x",
             "pinch_refinement": "own wrist camera; same anatomical side; near-field wrist and full two-finger chains; average with head only within disagreement threshold; otherwise head fallback",
-            "model_url": MODEL_URL, "mediapipe_version": version("mediapipe"),
+            "backend": "mano" if mano_mode else "mediapipe",
             "parameters": {k: v for k, v in vars(args).items() if isinstance(v, (int, float, bool))},
             "missing_policy": "action_raw.csv keeps NaN; action.csv includes only both-valid frames; no interpolation",
             "mask_semantics": "valid=pose geometry passed; pinch_valid=two tips in image and handedness passed; neither proves unoccluded visibility",
             "frame_mapping": "action.csv row N maps through frame_map.csv row N to source MP4 frame_index",
             "training_contract": "Use frame_map to select RGB and split by segment_id; use quality masks for per-arm losses; calibrate/retarget before mixing robot actions"}
+    for key in ("derived_from", "source_frame_indices", "source_ranges"):
+        if key in manifest:
+            meta[key] = manifest[key]
+    if mano_mode:
+        if predictor is None:
+            raise ValueError("MANO predictor missing; run setup_mano.cmd then label_mano.cmd")
+        meta.update(model=predictor.provenance(),
+                    tool_convention="origin=MANO joints[0]; rotation=MANO canonical wrist global_orient; left uses F R F with F=diag(-1,1,1); quaternion xyzw",
+                    pose_convention="T_C_W; MANO wrist root origin and canonical root axes; fixed head optical +x right +y down +z forward; meters; quaternion xyzw",
+                    fingertip_convention="MANO vertex 744=thumb, 320=index; OpenPose21 joints 4/8; distance=Euclidean meters",
+                    mano_parameters="mano.npz; camera,side axes explicit; left canonical parameters use the mirrored right template; hand_scale stored",
+                    camera_conversion="Fit rigid perspective camera to WiLoR nominal model projections (f=5000/256*max_image_size); update root orientation and wrist-pivot translation; residual is NOT image landmark accuracy",
+                    score_semantics="detector_score is YOLO box/class confidence; handedness_score and reprojection_rmse_px unavailable, stored NaN")
+    else:
+        meta.update(model_url=MODEL_URL, mediapipe_version=version("mediapipe"))
     meta_path = output / "manifest.json"
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     cameras = ["head"]
@@ -218,9 +242,21 @@ def process(episode, output, model, args):
             if abs(video.get(cv2.CAP_PROP_FPS) - fps) > .01:
                 raise ValueError(f"Synchronized video FPS mismatch: {camera}")
         rows = timestamps(episode, count, manifest, cameras)
+        frame_limit = getattr(args, "max_frames", 0)
+        limit = min(frame_limit, count) if frame_limit else count
         matrix, distortion, basis = camera_model(width, height, args.intrinsics)
+        camera_models = {"head": (matrix, distortion, basis)}
+        for camera in cameras[1:]:
+            video = caps[camera]
+            camera_models[camera] = camera_model(int(video.get(cv2.CAP_PROP_FRAME_WIDTH)), int(video.get(cv2.CAP_PROP_FRAME_HEIGHT)))
         meta.update(fps=fps, source_frames=count, cameras_used=cameras, intrinsics_basis=basis,
-                    camera_matrix=matrix.tolist(), distortion_coeffs=distortion.tolist())
+                    camera_matrix=matrix.tolist(), distortion_coeffs=distortion.tolist(),
+                    camera_intrinsics={c: {"matrix": k.tolist(), "distortion_coeffs": d.tolist(), "basis": b}
+                                       for c, (k, d, b) in camera_models.items()})
+        archive = None
+        if mano_mode:
+            from mano_backend import ManoArchive, draw_mesh
+            archive = ManoArchive(limit, cameras, args.hand_scale)
         if not args.no_preview:
             preview = cv2.VideoWriter(str(output / "preview.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
             if not preview.isOpened():
@@ -230,10 +266,10 @@ def process(episode, output, model, args):
                 if not wrist_preview.isOpened():
                     raise OSError("Cannot create wrist_preview.mp4")
         quality_fields = ["frame_index", "grid_index", "timestamp_unix_s", "head_timestamp_unix_s"]
-        side_fields = ("valid", "pose_valid", "reason", "handedness_score", "wrist_u_px", "wrist_v_px", "wrist_in_image",
+        side_fields = ("valid", "pose_valid", "reason", "handedness_score", "detector_score", "wrist_u_px", "wrist_v_px", "wrist_in_image",
                        "pinch_valid", "pinch_source", "pinch_reason", "pinch_distance_m", "pinch_distance_px", "gripper_m",
                        "head_pinch_distance_m", "wrist_pinch_distance_m", "wrist_pinch_distance_px",
-                       "wrist_handedness_score", "wrist_timestamp_unix_s", "reprojection_rmse_px")
+                       "wrist_handedness_score", "wrist_detector_score", "wrist_timestamp_unix_s", "reprojection_rmse_px", "camera_conversion_rmse_px")
         quality_fields += [f"{s}.{f}" for s in SIDES for f in
                            side_fields]
         previous_q, valid_counts = {}, dict.fromkeys(SIDES, 0)
@@ -245,8 +281,12 @@ def process(episode, output, model, args):
               (output / "action_raw.csv").open("w", newline="", encoding="utf-8") as raw,
               (output / "quality.csv").open("w", newline="", encoding="utf-8") as quality,
               (output / "frame_map.csv").open("w", newline="", encoding="utf-8") as mapping):
+            prefetched = None
+            if mano_mode and getattr(predictor, "gpu_model", None) is not None:
+                prefetched = predictor.iter_frames(caps, camera_models, args, limit)
+                stack.callback(prefetched.close)
             detectors = {}
-            for camera in cameras:
+            for camera in ([] if mano_mode else cameras):
                 threshold = .5 if camera == "head" else .3
                 options = mp.tasks.vision.HandLandmarkerOptions(
                     base_options=mp.tasks.BaseOptions(model_asset_path=str(model)),
@@ -261,18 +301,32 @@ def process(episode, output, model, args):
             rw.writerow(HEADER)
             qw.writeheader()
             mw.writerow(["action_row_index", "frame_index", "grid_index", "segment_id", "timestamp_unix_s", "head_timestamp_unix_s"])
-            for i, row in enumerate(rows):
+            for i, row in enumerate(rows[:limit]):
                 images, detected = {}, {}
-                for camera, video in caps.items():
+                if prefetched is not None:
+                    images, detected = next(prefetched)
+                for camera, video in ([] if prefetched is not None else caps.items()):
                     ok, image = video.read()
                     if not ok:
                         raise ValueError(f"Cannot decode {camera} source frame {i}")
                     images[camera] = image
                     key = f"{camera}_timestamp_unix_s"
                     ms = round((float(row[key]) - float(rows[0][key])) * 1000)
-                    result = detectors[camera].detect_for_video(mp.Image(image_format=mp.ImageFormat.SRGB,
-                                                               data=cv2.cvtColor(image, cv2.COLOR_BGR2RGB)), ms)
-                    detected[camera] = observations(result, image.shape[1], image.shape[0], args)
+                    if mano_mode and not hasattr(predictor, "detect_many"):
+                        detected[camera] = predictor.detect(image, *camera_models[camera][:2], args)
+                    elif not mano_mode:
+                        result = detectors[camera].detect_for_video(mp.Image(image_format=mp.ImageFormat.SRGB,
+                                                                   data=cv2.cvtColor(image, cv2.COLOR_BGR2RGB)), ms)
+                        detected[camera] = observations(result, image.shape[1], image.shape[0], args)
+                if mano_mode:
+                    if prefetched is None and hasattr(predictor, "detect_many"):
+                        detected = predictor.detect_many(images, camera_models, args)
+                    for camera, image in images.items():
+                        for side in SIDES:
+                            hand = unique_hand(detected[camera][side])
+                            archive.add(i, camera, side, hand)
+                            if preview:
+                                draw_mesh(image, hand, *camera_models[camera][:2], side)
                 frame = images["head"]
                 qrow = {k: row[k] for k in quality_fields[:4]}
                 vectors = []
@@ -286,7 +340,10 @@ def process(episode, output, model, args):
                         # Wrist pose no longer depends on fingertips being in the head image.
                         if head["inside"][[0, 5, 9, 17]].all():
                             try:
-                                value, _, error = estimate(head["world"], head["pixels"], matrix, distortion, args)
+                                if mano_mode:
+                                    value[:7] = head["pose"]
+                                else:
+                                    value, _, error = estimate(head["world"], head["pixels"], matrix, distortion, args)
                                 reason = "ok"
                             except (ValueError, cv2.error) as exc:
                                 reason = str(exc) if isinstance(exc, ValueError) else "pnp_failed"
@@ -318,9 +375,12 @@ def process(episode, output, model, args):
                     vectors.extend(value.tolist())
                     wrist_pixel = head["pixels"][0] if head["pixels"] is not None else [np.nan, np.nan]
                     for field, field_value in zip(side_fields,
-                        (int(valid), int(pose_valid), reason, head["score"], *wrist_pixel, int(head["wrist_in_image"]),
+                        (int(valid), int(pose_valid), reason, head.get("handedness_score", head["score"]),
+                         head["score"] if mano_mode else np.nan, *wrist_pixel, int(head["wrist_in_image"]),
                          int(pinch_valid), source, pinch_reason, distance, head["distance_px"], value[7], head["distance"],
-                         wrist["distance"], wrist["distance_px"], wrist["score"], row.get(f"{camera}_timestamp_unix_s", ""), error)):
+                         wrist["distance"], wrist["distance_px"], wrist.get("handedness_score", wrist["score"]),
+                         wrist["score"] if mano_mode else np.nan, row.get(f"{camera}_timestamp_unix_s", ""), error,
+                         head.get("camera_conversion_rmse_px", np.nan))):
                         qrow[f"{side}.{field}"] = field_value
                 record = [row["timestamp_unix_s"], *vectors]
                 rw.writerow(record)
@@ -340,15 +400,20 @@ def process(episode, output, model, args):
                     panels = [cv2.resize(images[f"{s}_wrist"], (640, 360)) if f"{s}_wrist" in images
                               else np.zeros((360, 640, 3), np.uint8) for s in SIDES]
                     wrist_preview.write(cv2.hconcat(panels))
-                if (i + 1) % 300 == 0:
-                    print(f"  {episode.name}: {i + 1}/{count} frames", flush=True)
-            for camera, video in caps.items():
+                if (i + 1) % (10 if mano_mode else 300) == 0:
+                    print(f"  {episode.name}: {i + 1}/{limit} frames", flush=True)
+            for camera, video in ([] if limit < count else caps.items()):
                 if video.read()[0]:
                     raise ValueError(f"{camera} contains more frames than declared")
-        meta.update(status="complete", processed_frames=count, valid_frames_per_hand=valid_counts,
+        if archive is not None:
+            archive.save(output / "mano.npz", limit)
+        meta.update(status="complete" if limit == count else "partial", processed_frames=limit,
+                    labeling_wall_s=time.perf_counter() - started,
+                    labeling_frames_per_s=limit / (time.perf_counter() - started),
+                    stop_reason="end_of_video" if limit == count else "frame_limit", valid_frames_per_hand=valid_counts,
                     pinch_valid_frames_per_hand=pinch_counts, pinch_source_counts=source_counts,
                     both_valid_frames=saved, contiguous_segments=segment + 1)
-        print(f"Saved {output}: {count} frames, valid L/R={valid_counts}, both={saved}", flush=True)
+        print(f"Saved {output}: {limit}/{count} frames, valid L/R={valid_counts}, both={saved}", flush=True)
     except Exception as exc:
         meta.update(status="failed", error=str(exc))
         raise
@@ -365,8 +430,15 @@ def process(episode, output, model, args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", nargs="?", type=Path, default=ROOT.parent / "HumanCapture/outputs/episodes")
-    parser.add_argument("--output", type=Path, default=ROOT / "result")
+    parser.add_argument("--output", type=Path, help="Defaults to result for MediaPipe, result/mano for MANO")
     parser.add_argument("--model", type=Path, default=ROOT / ".cache/hand_landmarker.task")
+    parser.add_argument("--backend", choices=("mediapipe", "mano"), default="mediapipe")
+    parser.add_argument("--mano-cache", type=Path, default=ROOT / ".cache/wilor")
+    parser.add_argument("--mano-repo", type=Path, default=ROOT / ".cache/WiLoR-mini")
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda", "igpu"), default="auto")
+    parser.add_argument("--threads", type=int, default=8)
+    parser.add_argument("--min-detection-score", type=float, default=.3, help="MANO backend: YOLO detector confidence")
+    parser.add_argument("--max-frames", type=int, default=0, help="Limit a validation run; 0 processes the whole episode")
     parser.add_argument("--intrinsics", type=Path, help="OpenCV pinhole JSON for the head COLOR stream")
     parser.add_argument("--hand-scale", type=float, default=1.)
     parser.add_argument("--gripper-max-m", type=float, default=.1, help="Matches current PiperX_Teleop config")
@@ -380,23 +452,27 @@ def main():
     parser.add_argument("--max-wrist-disagreement-m", type=float, default=.025,
                         help="Keep head distance if the matching wrist estimate differs by more than this")
     args = parser.parse_args()
+    if args.output is None:
+        args.output = ROOT / ("result/mano" if args.backend == "mano" else "result")
     if (not all(np.isfinite(x) for x in (args.hand_scale, args.gripper_max_m, args.pinch_closed_m,
                                          args.pinch_open_m, args.min_handedness, args.max_reprojection_px,
                                          args.max_wrist_disagreement_m))
             or args.hand_scale <= 0 or args.gripper_max_m <= 0 or args.pinch_closed_m < 0
             or args.pinch_open_m <= args.pinch_closed_m or not 0 <= args.min_handedness <= 1
-            or args.max_reprojection_px <= 0 or args.max_wrist_disagreement_m <= 0):
+            or args.max_reprojection_px <= 0 or args.max_wrist_disagreement_m <= 0
+            or args.threads < 1 or args.max_frames < 0 or not 0 < args.min_detection_score <= 1):
         parser.error("Invalid scale, distance, confidence or reprojection threshold")
     source = args.source.resolve()
     episodes = [source] if (source / "head.mp4").exists() else sorted(p.parent for p in source.rglob("head.mp4"))
     if not episodes:
         parser.error(f"No head.mp4 found: {source}")
-    if not args.model.exists():
+    if args.backend == "mediapipe" and not args.model.exists():
         args.model.parent.mkdir(parents=True, exist_ok=True)
         temporary = args.model.with_suffix(".download")
         print("Downloading official MediaPipe model...", flush=True)
         urllib.request.urlretrieve(MODEL_URL, temporary)
         temporary.replace(args.model)
+    predictor = None
     for episode in episodes:
         # Preserve task/episode layout. Single-episode calls still keep task and episode names.
         relative = Path(episode.parent.name) / episode.name if episode == source else episode.relative_to(source)
@@ -405,11 +481,17 @@ def main():
             previous = target / "manifest.json"
             if not previous.exists() or json.loads(previous.read_text(encoding="utf-8")).get("status") != "complete":
                 raise ValueError(f"Unfinished result exists; choose a new --output directory: {target}")
-            if json.loads(previous.read_text(encoding="utf-8")).get("pipeline_revision") != REVISION:
+            if json.loads(previous.read_text(encoding="utf-8")).get("pipeline_revision") != pipeline_revision(args):
                 raise ValueError(f"Result uses an older pose definition; archive it or use --output: {target}")
             print(f"Skip existing result (use --output for a new run): {target}", flush=True)
             continue
-        process(episode, target, args.model, args)
+        if args.backend == "mano" and predictor is None:
+            source_meta = json.loads((episode / "manifest.json").read_text(encoding="utf-8"))
+            if not source_meta.get("simulated"):
+                from mano_backend import WiLoRBackend
+                print("Loading WiLoR/MANO...", flush=True)
+                predictor = WiLoRBackend(args.mano_cache, args.mano_repo, args.device, args.threads, args.min_detection_score)
+        process(episode, target, args.model, args, predictor)
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
 .venv/
+.mano-venv/
 .cache/
 result/

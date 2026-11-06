@@ -160,6 +160,7 @@ def test_dropout_and_capture_gap_keep_mapping_and_segments(tmp_path, monkeypatch
         HandLandmarker=SimpleNamespace(create_from_options=detector_factory))),
         Image=lambda **kw: kw, ImageFormat=SimpleNamespace(SRGB="rgb"))
     monkeypatch.setitem(sys.modules, "mediapipe", fake_mp)
+    monkeypatch.setattr(label, "version", lambda package: "test")
     output = tmp_path / "result"
     label.process(episode, output, Path("unused.task"), options())
     actions, raw = read_csv(output / "action.csv"), read_csv(output / "action_raw.csv")
