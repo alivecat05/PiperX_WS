@@ -83,7 +83,7 @@ def test_clutch_reanchors_and_bounds_motion(cfg):
     assert mapper.update(hand, state, .02)[:7] == state[:7]
     hand["position"][2] = -.5  # Forward in XR maps to +X in robot base.
     moved = mapper.update(hand, state, .02)
-    assert 0 < moved[0] - state[0] <= .12*.02+1e-9
+    assert 0 < moved[0] - state[0] <= cfg["arms"]["left"]["max_speed_m_s"]*.02+1e-9
     assert np.isclose(np.linalg.norm(moved[3:7]), 1)
     hand["grip"] = False
     assert mapper.update(hand, state, .02)[:7] == state[:7]
@@ -202,12 +202,12 @@ def test_released_grips_required_for_home(cfg):
     assert "home_waypoints" in control.message
 
 
-def test_writer_and_export_preserve_gaps(cfg):
+def test_writer_and_export_validate_mp4_frames(cfg):
     sync, _, _, _ = synced_sample(cfg)
     row = sync.sample(10.)
     recorder = Recorder(cfg["output"], cfg, mock=True)
     recorder.start(10.)
-    for i in (0, 1, 4, 5):
+    for i in range(4):
         item = dict(row, timestamp_monotonic_s=10+i/30)
         recorder.add(item, i)
     recorder.stop()
@@ -217,9 +217,9 @@ def test_writer_and_export_preserve_gaps(cfg):
     with pytest.raises(ValueError, match="Mock data"):
         read_segments(cfg["output"])
     segments = read_segments(cfg["output"], allow_mock=True)
-    assert [len(rows) for _, _, rows in segments] == [2, 2]
-    (recorder.path/"images"/"head"/"00000000.jpg").unlink()
-    with pytest.raises(ValueError, match="Missing or invalid image"):
+    assert [len(rows) for _, _, rows in segments] == [4]
+    (recorder.path/"head.mp4").unlink()
+    with pytest.raises(ValueError, match="Missing/truncated video"):
         read_segments(cfg["output"], allow_mock=True)
 
 
@@ -256,9 +256,11 @@ def test_complete_teleop_record_and_home(cfg):
         step(control, packet())
         step(control, packet(record_start=True))
         until = time.perf_counter()+1.3
+        deadline = time.perf_counter()
         while time.perf_counter() < until:
             step(control, packet())
-            time.sleep(1/60)
+            deadline += 1/60  # Match the production control loop, including computation time.
+            time.sleep(max(0, deadline-time.perf_counter()))
         step(control, packet(record_stop=True))
         assert not control.status()["recording"] and control.status()["saving"]
         until = time.perf_counter()+2
@@ -379,7 +381,7 @@ def test_startup_requires_all_cameras_and_both_feedbacks(cfg, monkeypatch):
     control.close()
 
 
-def test_stalled_camera_stops_control_before_driver_timeout(cfg, monkeypatch):
+def test_stalled_camera_holds_without_emergency_stop_before_driver_timeout(cfg, monkeypatch):
     control = make_controller(cfg)
     stopped = []
     for side, robot in control.robots.items():
@@ -391,8 +393,8 @@ def test_stalled_camera_stops_control_before_driver_timeout(cfg, monkeypatch):
     control.cameras.histories["head"] = history
     step(control, packet(), camera_frames=False)
     assert not control.cameras.errors  # The camera worker hasn't raised an error yet.
-    assert control.mode == "fault" and "RGB head" in control.message
-    assert set(stopped) == set(ARMS)
+    assert control.mode == "recovery" and "RGB head" in control.message
+    assert stopped == []
 
 
 def test_input_arriving_during_feedback_read_is_not_rejected(cfg, monkeypatch):
@@ -432,10 +434,10 @@ def test_stop_flushes_tail_up_to_button_time_only(cfg):
     assert control.recorder.wait(timeout=3)
     rows = [json.loads(line) for line in (control.recorder.path/"samples.jsonl").read_text().splitlines()]
     assert [row["grid_index"] for row in rows] == [0, 1, 2]
-    assert rows[-1]["timestamp_monotonic_s"] == pytest.approx(10+2/30)
+    assert rows[-1]["timestamp_unix_s"] == pytest.approx(10+2/30+control.recorder.unix_offset)
     assert control.recorder.dropped == 0
     meta = json.loads((control.recorder.path/"manifest.json").read_text())
-    assert meta["status"] == "complete" and meta["end_monotonic_s"] == 10.075
+    assert meta["status"] == "complete" and meta["end_unix_s"] == pytest.approx(10.075+control.recorder.unix_offset)
     assert len(read_segments(cfg["output"], allow_mock=True)[0][2]) == 3
 
 
@@ -492,8 +494,10 @@ def test_full_writer_queue_can_be_closed_without_waiting(cfg, monkeypatch):
     try:
         recorder.start(10.)
         assert blocked.wait(1)
+        sync, _, _, _ = synced_sample(cfg)
+        sample = sync.sample(10.)
         for i in range(60):
-            recorder.add({"images": {}, "timestamp_monotonic_s": 10+i/30}, i)
+            recorder.add(dict(sample, timestamp_monotonic_s=10+i/30), i)
         start = time.perf_counter()
         recorder.stop(end_time=12.)
         assert time.perf_counter()-start < .2
@@ -535,7 +539,7 @@ def test_y_cancels_home_at_measured_joints_and_allows_teleop(cfg, monkeypatch):
     control.hold_since["reset"] = time.perf_counter()-2
     step(control, packet(reset=True))
     step(control, packet(reset=True))
-    assert control.mode == "resetting" and sent_home == ["left"]
+    assert control.mode == "resetting" and sent_home == ["left", "right"]
     step(control, packet())  # Release Y before pressing again.
     control.robots["left"].joints = [.05]*6
     control.robots["right"].joints = [-.03]*6
@@ -544,7 +548,7 @@ def test_y_cancels_home_at_measured_joints_and_allows_teleop(cfg, monkeypatch):
     assert control.mode == "idle" and not control.reset_jobs
     for _ in range(4):
         step(control, packet(reset=True))
-    assert sent_home == ["left"] and control.mode == "idle"
+    assert sent_home == ["left", "right"] and control.mode == "idle"
     data = packet()
     data["left"]["grip"] = True
     step(control, data)
@@ -620,11 +624,12 @@ def test_middle_button_holds_before_enable_then_follows_only_after_motion(cfg, m
     data["right"]["position"][0] += .01
     step(control, data)
     assert calls[-1] == "cartesian"
-    robot.vector[:3] = [.31, .02, .32]  # Release captures measured position, not old target.
-    step(control, packet())
-    assert calls[-1] == "hold"
-    np.testing.assert_allclose(control.actions["right"].latest().value[:3], [.31, .02, .32])
+    last_target = list(control.last_commands["right"]["target"])
+    robot.vector[:3] = [.31, .02, .32]  # Feedback can lag or differ at the release edge.
     count = len(calls)
+    step(control, packet())
+    assert len(calls) == count  # Release must not switch P -> J or replace the last target.
+    np.testing.assert_allclose(control.actions["right"].latest().value[:7], last_target[:7])
     step(control, packet())
     assert len(calls) == count
     step(control, data)  # New press starts at a new anchor, without stale delta replay.
@@ -867,7 +872,11 @@ def test_saved_confirmation_waits_for_disk_commit(cfg, monkeypatch):
         step(control, packet())
         step(control, packet(record_start=True))
         sync, _, _, _ = synced_sample(cfg)
-        control.recorder.add(sync.sample(10.), 0)
+        seed = sync.sample(10.)
+        seed["timestamp_monotonic_s"] = control.recorder.start_time
+        control.recorder.add(seed, 0)
+        control.grid_index = 1
+        control.next_record_t = control.recorder.start_time + 1/cfg["record_hz"]
         step(control, packet(record_stop=True))
         time.sleep(.09)
         step(control, packet())

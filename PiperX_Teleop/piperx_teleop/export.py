@@ -1,5 +1,6 @@
 """Native episodes -> official LeRobotDataset v3, using LeRobot 0.4.2."""
 import argparse
+import csv
 from importlib.metadata import version
 import json
 from pathlib import Path
@@ -10,10 +11,85 @@ import numpy as np
 from .core import CAMERAS, VECTOR_NAMES
 
 
+class EpisodeFrames:
+    """Sequential MP4 decoding, with compatibility for existing JPEG episodes."""
+    def __init__(self, path, meta):
+        self.path, self.meta = Path(path).resolve(), meta
+        self.videos, self.next_index = {}, 0
+
+    def _path(self, relative):
+        path = (self.path / relative).resolve()
+        if not path.is_relative_to(self.path):
+            raise ValueError("Image/video path outside episode")
+        return path
+
+    def __enter__(self):
+        try:
+            if self.meta["schema"] == "piperx.rgb_action.v2":
+                for name in CAMERAS:
+                    video = cv2.VideoCapture(str(self._path(self.meta["videos"][name])))
+                    self.videos[name] = video
+                    if not video.isOpened() or int(video.get(cv2.CAP_PROP_FRAME_COUNT)) != self.meta["frames"]:
+                        raise ValueError(f"Missing/truncated video: {name}")
+                    if abs(video.get(cv2.CAP_PROP_FPS) - self.meta["fps"]) > .01:
+                        raise ValueError(f"Video FPS mismatch: {name}")
+            return self
+        except Exception:
+            self.close()
+            raise
+
+    def read(self, row):
+        if self.videos:
+            if row["videos"] != self.meta["videos"] or row["frame_index"] < self.next_index:
+                raise ValueError("Invalid video reference/frame order")
+            while self.next_index <= row["frame_index"]:
+                images = {}
+                for name, video in self.videos.items():
+                    ok, frame = video.read()
+                    if not ok:
+                        raise ValueError(f"Could not decode {name} frame {self.next_index}")
+                    images[name] = frame
+                self.next_index += 1
+        else:
+            images = {name: cv2.imdecode(np.fromfile(self._path(row["images"][name]), dtype=np.uint8),
+                                         cv2.IMREAD_COLOR) for name in CAMERAS}
+        for name, image in images.items():
+            camera = self.meta["config"]["cameras"][name]
+            if image is None or image.shape != (camera["height"], camera["width"], 3):
+                raise ValueError(f"Invalid image dimensions: {name}")
+        return images
+
+    def close(self):
+        for video in self.videos.values():
+            video.release()
+        self.videos.clear()
+
+    def __exit__(self, *args):
+        self.close()
+
+
+def check_action_csv(path, rows):
+    with (path / "action.csv").open(encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream)
+        if reader.fieldnames != ["timestamp_unix_s", *VECTOR_NAMES]:
+            raise ValueError("Unexpected action.csv columns")
+        for row in rows:
+            record = next(reader, None)
+            if record is None:
+                raise ValueError("action.csv has fewer rows than samples.jsonl")
+            values = np.array([float(record[name]) for name in VECTOR_NAMES])
+            stamp = float(record["timestamp_unix_s"])
+            if (not np.isfinite(stamp) or abs(stamp - row["timestamp_unix_s"]) > 1e-6
+                    or not np.array_equal(values, row["action"])):
+                raise ValueError("action.csv does not match samples.jsonl")
+        if next(reader, None) is not None:
+            raise ValueError("action.csv has extra rows")
+
+
 def read_segments(source, allow_mock=False):
     """Reject unfinished episodes; split gaps instead of hiding missing real time."""
     source = Path(source)
-    paths = [source] if (source / "manifest.json").exists() else sorted(source.glob("episode_*"))
+    paths = [source] if (source / "manifest.json").exists() else sorted(p.parent for p in source.rglob("manifest.json"))
     result, fingerprint = [], None
     for path in paths:
         manifest_path = path / "manifest.json"
@@ -25,8 +101,10 @@ def read_segments(source, allow_mock=False):
             continue
         if meta["simulated"] and not allow_mock:
             raise ValueError(f"Mock data excluded by default: {path}; use --allow-mock only for validation")
-        if meta["schema"] != "piperx.rgb_action.v1" or meta["vector_names"] != VECTOR_NAMES:
+        if meta["schema"] not in ("piperx.rgb_action.v1", "piperx.rgb_action.v2") or meta["vector_names"] != VECTOR_NAMES:
             raise ValueError(f"Unsupported schema: {path}")
+        if meta.get("storage_layout") == "task/capture_index":
+            meta["task"] = path.resolve().parent.name
         cfg = meta["config"]
         signature = json.dumps({"fps": meta["fps"], "simulated": meta["simulated"],
             "tcp": {s: c["tcp_offset"] for s, c in cfg["arms"].items()},
@@ -37,8 +115,21 @@ def read_segments(source, allow_mock=False):
         rows = [json.loads(line) for line in (path / "samples.jsonl").read_text(encoding="utf-8").splitlines()]
         if not rows or len(rows) != meta["frames"]:
             raise ValueError(f"Manifest/frame count mismatch: {path}")
+        modern = meta["schema"] == "piperx.rgb_action.v2"
+        if modern:
+            check_action_csv(path, rows)
+        with EpisodeFrames(path, meta) as frames:
+            for index, row in enumerate(rows):
+                if row["frame_index"] != index:
+                    raise ValueError("Frame indexes must match row order")
+                frames.read(row)
+        stamp_key = "timestamp_unix_s" if modern else "timestamp_monotonic_s"
         segments, current = [], []
         for row in rows:
+            if not np.isfinite(row[stamp_key]):
+                raise ValueError("Invalid sample timestamp")
+            if modern and row["grid_index"] != row["frame_index"]:
+                raise ValueError("Complete MP4 episodes must have a contiguous recording grid")
             if current and row["grid_index"] != current[-1]["grid_index"] + 1:
                 segments.append(current)
                 current = []
@@ -46,16 +137,7 @@ def read_segments(source, allow_mock=False):
                 value = np.asarray(row[key])
                 if value.shape != (16,) or not np.isfinite(value).all():
                     raise ValueError(f"Invalid {key} in {path}")
-            for name in CAMERAS:
-                relative = Path(row["images"][name])
-                image_path = (path / relative).resolve()
-                if not image_path.is_relative_to(path.resolve()):
-                    raise ValueError("Image path outside episode")
-                image = cv2.imread(str(image_path))
-                c = cfg["cameras"][name]
-                if image is None or image.shape != (c["height"], c["width"], 3):
-                    raise ValueError(f"Missing or invalid image: {image_path}")
-            if current and abs((row["timestamp_monotonic_s"] - current[-1]["timestamp_monotonic_s"])
+            if current and abs((row[stamp_key] - current[-1][stamp_key])
                                - 1 / meta["fps"]) > .002:
                 raise ValueError("Timestamp/grid mismatch")
             current.append(row)
@@ -92,14 +174,14 @@ def convert(source, target, repo_id, allow_mock=False, image_mode=False, validat
         image_writer_threads=4, image_writer_processes=0)
     try:
         for path, manifest, rows in segments:
-            for row in rows:
-                frame = {key: np.asarray(row[key], dtype=np.float32) for key in ("observation.state", "action")}
-                for name in CAMERAS:
-                    bgr = cv2.imread(str(path / row["images"][name]))
-                    frame[f"observation.images.{name}"] = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                frame["task"] = manifest["task"]
-                dataset.add_frame(frame)
-            dataset.save_episode()
+            with EpisodeFrames(path, manifest) as frames:
+                for row in rows:
+                    frame = {key: np.asarray(row[key], dtype=np.float32) for key in ("observation.state", "action")}
+                    for name, bgr in frames.read(row).items():
+                        frame[f"observation.images.{name}"] = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                    frame["task"] = manifest["task"]
+                    dataset.add_frame(frame)
+                dataset.save_episode()
     finally:
         dataset.finalize()
     # Preserve source timing/configuration for audit; LeRobot time is a fresh uniform grid per segment.

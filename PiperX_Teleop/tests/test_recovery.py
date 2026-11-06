@@ -53,8 +53,75 @@ def test_stop_only_after_control_commands(started, monkeypatch):
     assert set(stopped) == (set(robots) if started else set())
     stopped.clear()
     control.close()
-    assert set(stopped) == (set(robots) if started else set())
+    assert stopped == []  # The fault stop must not be replaced or repeated by shutdown.
     assert set(closed) == set(robots)
+
+
+@pytest.mark.parametrize("gripper_enabled", [False, True])
+def test_normal_exit_holds_current_feedback_without_disabling_or_enabling(monkeypatch, gripper_enabled):
+    cfg = config()
+    robots = {side: MockPiperX(arm) for side, arm in cfg["arms"].items()}
+    calls = []
+    for side, robot in robots.items():
+        robot.joints = [.2] * 6
+        robot.vector[7] = .025
+        sample = robot.read()
+        sample[1]["gripper_enabled"] = gripper_enabled
+        monkeypatch.setattr(robot, "read", lambda sample=sample: sample)
+        monkeypatch.setattr(robot, "hold", lambda joints, side=side: calls.append((side, "hold", joints)))
+        monkeypatch.setattr(robot, "send_gripper", lambda width, side=side: calls.append((side, "gripper", width)))
+        monkeypatch.setattr(robot, "close", lambda side=side: calls.append((side, "close")))
+        monkeypatch.setattr(robot, "stop", lambda: pytest.fail("Normal exit requested emergency stop"))
+        monkeypatch.setattr(robot, "enable", lambda: pytest.fail("Normal exit enabled motors"))
+    control = Controller(cfg, robots, Cameras(cfg, mock=True), mock=True)
+    control.commands_started = True
+    control.mode = "resetting"  # Must cancel a pending home trajectory too.
+    control.close()
+    for side in robots:
+        expected = [("hold", [.2] * 6)]
+        if gripper_enabled:
+            expected.append(("gripper", .025))
+        expected.append(("close",))
+        assert [call[1:] for call in calls if call[0] == side] == expected
+
+
+@pytest.mark.parametrize("failure", ["missing", "stale", "hold"])
+def test_shutdown_cannot_hold_falls_back_to_stop_and_closes(failure, monkeypatch):
+    cfg = config()
+    robots = {side: MockPiperX(arm) for side, arm in cfg["arms"].items()}
+    stopped, closed, held = [], [], []
+    for side, robot in robots.items():
+        monkeypatch.setattr(robot, "stop", lambda side=side: stopped.append(side))
+        monkeypatch.setattr(robot, "close", lambda side=side: closed.append(side))
+        monkeypatch.setattr(robot, "hold", lambda joints, side=side: held.append(side))
+    if failure == "missing":
+        monkeypatch.setattr(robots["right"], "read", lambda: None)
+    elif failure == "stale":
+        t, state = robots["right"].read()
+        state["source_timestamps"] = {"tcp": t, "joint_12": t-1}
+        monkeypatch.setattr(robots["right"], "read", lambda: (t, state))
+    else:
+        def fail_hold(_):
+            raise RuntimeError("Cannot hold measured joints")
+        monkeypatch.setattr(robots["right"], "hold", fail_hold)
+    control = Controller(cfg, robots, Cameras(cfg, mock=True), mock=True)
+    control.commands_started = True
+    control.close()
+    assert stopped == ["right"]
+    assert held == ["left"]
+    assert set(closed) == set(robots)
+
+
+def test_exit_before_control_does_not_send_hold_or_stop(monkeypatch):
+    cfg = config()
+    robots = {side: MockPiperX(arm) for side, arm in cfg["arms"].items()}
+    for robot in robots.values():
+        def forbidden(*_):
+            pytest.fail("Exit before control sent a robot command")
+        for name in ("read", "hold", "send_gripper", "enable", "stop"):
+            monkeypatch.setattr(robot, name, forbidden)
+    control = Controller(cfg, robots, Cameras(cfg, mock=True), mock=True)
+    control.close()
 
 
 def test_recover_requires_supported_arms(monkeypatch):

@@ -11,8 +11,10 @@ from scipy.spatial.transform import Rotation
 
 from .core import ARMS, History, PoseMapper, Synchronizer
 from .recording import Recorder
+from .capture_session import CaptureSelection
+from .operator_controls import OperatorControls
 from .feedback import Feedback
-from .robot import validate_vector
+from .robot import RecoverableRobotError, validate_vector
 
 LOG = logging.getLogger(__name__)
 
@@ -34,8 +36,10 @@ class Controller:
         self.paused_width = {}
         self.last_commands = {}
         self.enable_since = dict.fromkeys(ARMS, None)
-        self.sync = Synchronizer(cameras.histories, self.states, self.actions, cfg["sync"])
+        self.sync = Synchronizer(cameras.histories, self.states, self.actions, cfg["sync"], 1/cfg["record_hz"])
         self.recorder = Recorder(cfg["output"], cfg, mock)
+        self.capture = CaptureSelection(self.recorder, cfg["task"])
+        self.operator = OperatorControls(self)
         self.record_end_t = None
         self.ready, self.feedback_missing = False, list(ARMS)
         self.mode, self.message = "waiting", "Waiting for three RGB cameras, both arms and Quest"
@@ -53,6 +57,15 @@ class Controller:
         self.hold_since, self.hold_latched = {}, set()
         self.connected = False
         self.commands_started = False
+        self.recovery_request = False
+        self.recovery_hold_targets = {}
+        self.recovery_hold_status = {}
+        self.recovery_reason = ""
+        self.recovery_pose_issues = {}
+        self.recovery_hardware_missing = []
+        self.teach_exit_pending = {}
+        self.teach_exit_error = ""
+        self.recovery_after_teach_exit = False
 
     def accept(self, packet, received=None):
         received = time.perf_counter() if received is None else received
@@ -105,17 +118,46 @@ class Controller:
         now = time.perf_counter()
         recording = self.recorder.active and self.record_end_t is None
         return {"mode": self.mode, "ready": self.ready, "recording": recording,
+                "capture": self.capture.snapshot(), "replay": self.operator.snapshot(),
+                "position_scale": {s: self.cfg["arms"][s]["position_scale"] for s in ARMS},
+                "follow": self.follow_status(now),
                 "quest": self.input_status(),
                 "grippers": self.gripper_status(),
                 "event_ack": self.event_ack, "notifications": self.feedback.snapshot(),
                 "haptics": self.feedback.haptics,
                 "saving": self.recorder.busy and not recording,
                 "frames": self.recorder.count, "dropped": self.recorder.dropped,
+                "recording_result": self.recorder.result,
                 "message": self.message, "camera_errors": dict(self.cameras.errors),
+                "camera_timestamps": {n: (h.latest().value.get("timestamp_basis") if h.latest() else None)
+                                      for n, h in self.cameras.histories.items()},
+                "recording_drops": dict(self.recorder.drop_reasons),
+                "recovery_hold": dict(self.recovery_hold_status),
+                "robot_status": {s: ({k: h.latest().value.get(k) for k in
+                    ("arm_status", "err_code", "teaching", "teach_status", "ctrl_mode", "arm_enabled", "teach_exit_supported")}
+                    if h.latest() else {}) for s, h in self.states.items()},
+                "recovery": {"reason": self.recovery_reason,
+                             "armed": getattr(self, "recovery_y_armed", False),
+                             "enabling": getattr(self, "recovery_enabling", False),
+                             "exiting_teaching": bool(self.teach_exit_pending), "teach_exit_error": self.teach_exit_error,
+                             "pose_issues": dict(self.recovery_pose_issues),
+                             "hardware_missing": list(self.recovery_hardware_missing)},
                 "fps": {"cameras": {n: h.fps(now) for n, h in self.cameras.histories.items()},
                         "action": {n: h.fps(now) for n, h in self.actions.items()},
                         "state": {n: h.fps(now) for n, h in self.states.items()},
                         "recording": self.recorder.writes.fps(now) if self.recorder.busy else 0.}}
+
+    def follow_status(self, now):
+        result = {}
+        for side in ARMS:
+            state, action = self.states[side].latest(), self.actions[side].latest()
+            result[side] = {
+                "position_error_mm": (round(float(np.linalg.norm(np.asarray(action.value[:3])-
+                    state.value["vector"][:3]))*1000, 1) if state and action else None),
+                "command_age_ms": round((now-action.t)*1000, 1) if action else None,
+                "rate_limited": bool(self.mappers[side].rate_limited),
+            }
+        return result
 
     def gripper_status(self):
         result = {}
@@ -151,6 +193,7 @@ class Controller:
         self.feedback.emit(kind, message)
 
     def _fault(self, message):
+        self.operator.abort()
         LOG.info("Last commands before fault: %s", json.dumps(self.last_commands))
         LOG.info("Quest at fault: %s", json.dumps(self.input_status()))
         for robot in self.robots.values() if self.commands_started else ():
@@ -171,6 +214,8 @@ class Controller:
         for side, robot in self.robots.items():
             try:
                 result = robot.read()
+            except RecoverableRobotError as error:
+                raise RecoverableRobotError(f"{side}: {error}") from error
             except Exception as error:
                 raise RuntimeError(f"{side}: {error}") from error
             if result:
@@ -182,6 +227,241 @@ class Controller:
         if self.feedback_missing:
             return None
         return {side: sample.value for side, sample in latest.items()}
+
+    def request_recovery(self):
+        """Queue an explicit operator request; the control thread validates and executes it."""
+        with self.input_lock:
+            if self.mode == "recovery":
+                self.recovery_request = True
+
+    def _read_recovery_states(self):
+        states = {}
+        for side, robot in self.robots.items():
+            sample = robot.read_recovery()
+            if sample is None:
+                raise RuntimeError(f"{side}: no feedback for recovery hold")
+            _, state = sample
+            now = time.perf_counter()
+            stamps = state["source_timestamps"]
+            if not stamps or any(not -.05 <= now-stamp <= self.cfg["feedback_timeout_s"]
+                                 for stamp in stamps.values()):
+                raise RuntimeError(f"{side}: stale feedback for recovery hold")
+            self.states[side].add(*sample)
+            states[side] = state
+        self.feedback_missing = []
+        return states
+
+    def _enter_recovery(self, reason):
+        """Preserve motor power for rejected targets; never reset or disable automatically."""
+        self.operator.abort()
+        self.recovery_reason = reason
+        self.teach_exit_pending = {}
+        self.teach_exit_error = ""
+        self.recovery_after_teach_exit = False
+        self.recovery_pose_issues = {}
+        self.recovery_hardware_missing = []
+        self.ready = False
+        self.recorder.stop(reason, complete=False)
+        self.record_end_t = None
+        self.reset_jobs, self.reset_active = [], None
+        self.recovery_hold_targets = {}
+        self.recovery_hold_status = {}
+        self.recovery_started = time.perf_counter()
+        self.recovery_settled_since = dict.fromkeys(ARMS, None)
+        self.recovery_last_joints = {}
+        self.recovery_neutral_since = None
+        self.recovery_y_armed = False
+        self.recovery_enabling = False
+        self.recovery_enable_ok = dict.fromkeys(ARMS, False)
+        self.hold_since.clear()
+        self.hold_latched.clear()
+        self.previous_hands.clear()
+        with self.input_lock:
+            self.recovery_request = False
+            self.input_events.clear()
+            self.event_ack = self.last_event
+        try:
+            states = self._read_recovery_states()
+            for side, state in states.items():
+                self.recovery_last_joints[side] = (time.perf_counter(), np.asarray(state["joints"]).copy())
+                self.motion_active[side] = self.enabled[side] = False
+                self.enable_since[side] = None
+                self.cartesian_blocked[side] = ""
+                self.hand_rearm[side] = self.gripper_rearm[side] = True
+                self.mappers[side].release(state["vector"])
+                if state.get("teaching", False):
+                    self.recovery_hold_status[side] = "teaching - no commands"
+                    continue
+                self.commands_started = True
+                self.robots[side].hold(list(state["joints"]))
+                self.recovery_hold_targets[side] = list(state["joints"])
+                self.recovery_hold_status[side] = "requested - awaiting feedback"
+                if state.get("gripper_enabled", False):
+                    self.robots[side].send_gripper(state["vector"][7])
+                self.actions[side].add(time.perf_counter(), list(state["vector"]))
+        except Exception as error:
+            self._fault(f"Recovery hold unavailable: {error}")
+            return
+        self.mode = "recovery"
+        self._notify("paused", reason + "; hold requested; teach manually, exit teaching, release controls, then hold Y or press R")
+        LOG.warning("Recoverable motion rejection; holding without emergency stop/reset: %s", reason)
+
+    def _recovery_tick(self, now, events):
+        with self.input_lock:
+            packet = self.packet
+            requested, self.recovery_request = self.recovery_request, False
+        states = self._read_recovery_states()
+        for side, sent in list(self.teach_exit_pending.items()):
+            state = states[side]
+            if (not state.get("teaching") and state.get("ctrl_mode") == 1
+                    and state.get("arm_status", 0) == 0 and not state.get("err_code", 0)
+                    and state["source_timestamps"].get("status", 0) > sent):
+                del self.teach_exit_pending[side]
+            elif time.perf_counter()-sent > 3:
+                self.teach_exit_pending.clear()
+                self.recovery_after_teach_exit = False
+                self.teach_exit_error = "退出示教未收到新的 CAN 正常状态确认，请扶稳机械臂并检查本体状态；未执行 reset 或失能"
+                self._notify("rejected", self.teach_exit_error)
+                break
+        self._reject_events(events, "Recovery; teleoperation and recording are suspended")
+        teaching = []
+        for side, state in states.items():
+            target = self.recovery_hold_targets.get(side)
+            checked_at = time.perf_counter()
+            last_t, last_joints = self.recovery_last_joints[side]
+            joints = np.asarray(state["joints"])
+            quiet = np.max(np.abs(joints-last_joints))/max(checked_at-last_t, 1e-6) < .05
+            self.recovery_last_joints[side] = checked_at, joints.copy()
+            if state.get("teaching", False):
+                teaching.append(side)
+                self.recovery_hold_status[side] = "teaching - no commands"
+                self.recovery_settled_since[side] = None
+            elif (target is not None and state.get("arm_status", 0) == 0
+                  and state.get("arm_enabled") is True and state.get("mode_feedback") == 1
+                  and quiet and np.max(np.abs(joints-target)) < .01):
+                since = self.recovery_settled_since[side]
+                self.recovery_settled_since[side] = checked_at if since is None else since
+                self.recovery_hold_status[side] = ("joint hold confirmed" if
+                    checked_at-self.recovery_settled_since[side] >= .2 else "joint hold settling")
+            else:
+                self.recovery_settled_since[side] = None
+                self.recovery_hold_status[side] = "hold NOT confirmed - support arm"
+        if teaching:
+            self.recovery_enabling = self.recovery_y_armed = False
+            self.recovery_neutral_since = None
+            self.hold_since.clear()
+            if requested and not self.teach_exit_pending:
+                held_input = (packet and 0 <= time.perf_counter()-packet[0] <= self.cfg["input_timeout_s"]
+                    and (any(packet[1][s]["grip"] or packet[1][s]["trigger"] > .05 for s in ARMS)
+                         or any(v for k, v in packet[1]["buttons"].items() if k != "reset")))
+                if held_input:
+                    self.message = "请先松开手柄的中指键、食指扳机和面键，再点击恢复遥操退出示教"
+                    return
+                self.teach_exit_error = ""
+                try:
+                    for side in teaching:
+                        if not states[side].get("teach_exit_supported"):
+                            raise ValueError(f"{side}: 当前固件配置不支持软件无断电退出，请使用本体退出示教")
+                    for side in teaching:
+                        joints = list(states[side]["joints"])
+                        self.robots[side].exit_teaching(joints)
+                        self.teach_exit_pending[side] = time.perf_counter()
+                        self.recovery_hold_targets[side] = joints
+                    self.recovery_after_teach_exit = True
+                    self.teach_exit_deadline = time.perf_counter()+5
+                except ValueError as error:
+                    self.recovery_after_teach_exit = False
+                    self.teach_exit_error = str(error)
+                    self._notify("rejected", str(error))
+                    return
+            if self.teach_exit_pending:
+                self.message = "正在主动退出示教并保持当前关节位置，等待控制器反馈确认；未执行 reset 或失能"
+                return
+            self.message = "Teaching: " + ", ".join(teaching) + "; no motion commands; exit teaching before recovery"
+            return
+        if self.teach_exit_pending:
+            self.message = "已发送退出示教，等待新的 CAN 正常状态确认；保持暂停"
+            return
+        self.recovery_pose_issues = {}
+        for side in ARMS:
+            issue = self.robots[side].cartesian_start_issue(states[side]["joints"])
+            if issue:
+                self.recovery_pose_issues[side] = issue
+        self.recovery_hardware_missing = self._waiting_for(now, [])
+        data = packet[1] if packet and 0 <= time.perf_counter()-packet[0] <= self.cfg["input_timeout_s"] else None
+        valid_input = data and data["active"] and all(data[s]["tracked"] for s in ARMS)
+        hands_neutral = valid_input and all(not data[s]["grip"] and data[s]["trigger"] <= .05 for s in ARMS)
+        neutral = hands_neutral and not any(data["buttons"].values())
+        if neutral:
+            self.recovery_neutral_since = now if self.recovery_neutral_since is None else self.recovery_neutral_since
+            if now-self.recovery_neutral_since >= .3:
+                self.recovery_y_armed = True
+        elif not hands_neutral:
+            self.recovery_neutral_since = None
+            self.recovery_y_armed = False
+        y_only = hands_neutral and not any(value for name, value in data["buttons"].items() if name != "reset")
+        if self.recovery_after_teach_exit and not self.teach_exit_pending:
+            if not y_only or time.perf_counter() > self.teach_exit_deadline:
+                self.recovery_after_teach_exit = False
+            elif self.recovery_y_armed:
+                requested = True
+                self.recovery_after_teach_exit = False
+        if self.recovery_y_armed and self._held("reset", bool(y_only and data["buttons"]["reset"]), now, 1.5):
+            requested = True
+        self.message = ("Recovery: check hold confirmation; teach manually if needed, exit teaching; "
+                        "release controls for 0.3s, then hold Y 1.5s or press R")
+        if self.recovery_enabling and not hands_neutral:
+            self.recovery_enabling = False
+        if requested and not self.recovery_enabling:
+            if not self.recovery_y_armed or not y_only:
+                self.message = "Recovery rejected: restore tracking and release middle buttons/triggers first"
+                return
+            if any(state.get("arm_status", 0) != 0 or state.get("err_code", 0) for state in states.values()):
+                self.message = "Recovery rejected: controller still reports a fault; no reset or disable was sent"
+                return
+            missing = self._waiting_for(now, [])
+            issues = []
+            for side in ARMS:
+                issue = self.robots[side].cartesian_start_issue(states[side]["joints"])
+                if issue:
+                    issues.append(f"{side}: {issue}")
+            if missing or issues:
+                self.message = "Recovery rejected: " + "; ".join(missing+issues)
+                return
+            for side, state in states.items():
+                self.robots[side].hold(list(state["joints"]))  # Replace all old targets BEFORE enabling.
+                self.recovery_hold_targets[side] = list(state["joints"])
+                self.recovery_settled_since[side] = None
+            self.recovery_enable_ok = dict.fromkeys(ARMS, False)
+            self.recovery_enable_start = time.perf_counter()
+            self.recovery_enabling = True
+        if not self.recovery_enabling:
+            return
+        if now-self.recovery_enable_start > 5:
+            self.recovery_enabling = False
+            self.message = "Recovery enable timeout; remain held; check controller status"
+            return
+        for side in ARMS:
+            if not self.recovery_enable_ok[side]:
+                self.recovery_enable_ok[side] = bool(self.robots[side].enable())
+        if not all(self.recovery_enable_ok.values()) or any(
+                state.get("arm_enabled") is not True or state.get("arm_status", 0) != 0
+                or state["source_timestamps"].get("status", 0) <= self.recovery_enable_start
+                for state in states.values()):
+            self.message = "Recovery: waiting for fresh enabled NORMAL feedback; no teleoperation targets"
+            return
+        for side, state in states.items():
+            self.mappers[side].release(state["vector"])
+            self.paused_width[side] = state["vector"][7]
+            self.motion_active[side] = self.enabled[side] = False
+            self.hand_rearm[side] = self.gripper_rearm[side] = True
+        self.previous_hands.clear()
+        self.resume_hands = set(ARMS)
+        self.resume_since = None
+        self.recovery_enabling = False
+        self.connected = True
+        self.mode = "paused"
+        self._notify("paused", "Recovery complete; release all controls, then press middle again to take control")
 
     def _pause_input(self, states, reason, required_hands=()):
         self.resume_since = None
@@ -275,7 +555,8 @@ class Controller:
         self.mode = "resetting"
         self._notify("home_started", "Going home; release Y and press Y again to cancel")
         self.reset_jobs = [(s, joints) for s in ARMS for joints in self.cfg["arms"][s]["home_waypoints"]]
-        self.reset_active = None
+        self.reset_active = {}
+        self.reset_prepared = False
         self.reset_start = now
 
     def _cancel_reset(self, states):
@@ -294,6 +575,10 @@ class Controller:
 
     def _reset_tick(self, states, now):
         self.commands_started = True
+        if not self.reset_prepared:
+            for side in ARMS:
+                self.robots[side].hold(states[side]["joints"])
+            self.reset_prepared = True
         # Wait for enable acknowledgements without blocking input/feedback watchdogs.
         for side in ARMS:
             if not self.enabled[side]:
@@ -302,17 +587,25 @@ class Controller:
             if now - self.reset_start > 5:
                 raise TimeoutError("Home enable timeout")
             return
-        if self.reset_active is not None:
-            side, joints, sent, settled = self.reset_active
-            if now - sent > self.cfg["reset_timeout_s"]:
-                raise TimeoutError(f"Home waypoint timeout: {side}")
-            reached = np.max(np.abs(np.array(states[side]["joints"]) - joints)) < .04
-            settled = (settled or now) if reached else None
-            self.reset_active = side, joints, sent, settled
-            if settled is None or now - settled < .3:
-                return
-            self.reset_active = None
-        if not self.reset_jobs:
+        # Both arms start in this tick and advance their own waypoints independently.
+        for side in ARMS:
+            active = self.reset_active.get(side)
+            if active is not None:
+                joints, sent, settled = active
+                if now - sent > self.cfg["reset_timeout_s"]:
+                    raise TimeoutError(f"Home waypoint timeout: {side}")
+                reached = np.max(np.abs(np.array(states[side]["joints"]) - joints)) < .04
+                settled = (now if settled is None else settled) if reached else None
+                self.reset_active[side] = joints, sent, settled
+                if settled is None or now - settled < .3:
+                    continue
+                del self.reset_active[side]
+            job = next((i for i, (arm, _) in enumerate(self.reset_jobs) if arm == side), None)
+            if job is not None:
+                _, joints = self.reset_jobs.pop(job)
+                self.robots[side].move_home(joints)
+                self.reset_active[side] = joints, now, None
+        if not self.reset_jobs and not self.reset_active:
             self.mode = "idle"
             self._notify("home_done", "Home complete")
             for side in ARMS:
@@ -320,9 +613,6 @@ class Controller:
                 self.motion_active[side] = False
                 self.enabled[side] = False  # Restore normal speed on next grip press.
             return
-        side, joints = self.reset_jobs.pop(0)
-        self.robots[side].move_home(joints)
-        self.reset_active = side, joints, now, None
 
     def _finish_record(self):
         if not self.recorder.busy and self.record_end_t is not None:
@@ -330,7 +620,8 @@ class Controller:
             if self.recorder.result == "complete":
                 self._notify("saved", f"Saved {self.recorder.path}")
             else:
-                self._notify("rejected", "No synchronized frames; episode incomplete")
+                self._notify("rejected", f"Episode incomplete: {self.recorder.dropped} missing grid ticks; "
+                             f"{dict(self.recorder.drop_reasons)}; see manifest.json")
 
     def _record_tick(self, now):
         if self.recorder.error:
@@ -346,9 +637,9 @@ class Controller:
             if sample:
                 self.recorder.add(sample, self.grid_index)
             else:
-                self.recorder.dropped += 1
+                self.recorder.drop(self.sync.rejection or "synchronization_missing")
             self.grid_index += 1
-            self.next_record_t += 1 / self.cfg["record_hz"]
+            self.next_record_t = self.recorder.start_time + self.grid_index / self.cfg["record_hz"]
         if self.record_end_t is not None and self.next_record_t > self.record_end_t:
             self.recorder.stop(end_time=self.record_end_t)
 
@@ -375,13 +666,26 @@ class Controller:
                 self._notify("rejected", "Going home; press Y again to cancel first")
             return
         if name == "record_start":
+            if self.capture.error:
+                self._notify("rejected", self.capture.error)
+                return
+            unmapped = [n for n, h in self.cameras.histories.items() if h.latest()
+                        and h.latest().value.get("timestamp_basis") == "host_receive"]
+            if self.cfg["sync"].get("require_sdk_timestamps", True) and unmapped:
+                self._notify("rejected", "Recording needs SDK global/system timestamps: " + ", ".join(unmapped))
+                return
             if not all(self.input_status()[s]["tracked"] for s in ARMS):
                 self._notify("rejected", "Recording needs both controllers tracked")
                 return
             if self.recorder.busy:
                 self._notify("rejected", "Already recording or saving; wait before starting another episode")
                 return
-            self.recorder.start(event["t"])
+            try:
+                self.capture.start(event["t"])
+            except (ValueError, OSError) as error:
+                self.capture.error = str(error)
+                self._notify("rejected", str(error))
+                return
             self.record_end_t = None
             self.next_record_t, self.grid_index = event["t"], 0
             self.sync.last_frames = {}
@@ -394,15 +698,30 @@ class Controller:
                 self._notify("rejected", "Already saving" if self.recorder.busy else "Not recording")
 
     def tick(self, now, dt):
+        self.capture.refresh()
+        self.operator.apply_requests(now)
         with self.input_lock:
             events = list(self.input_events)
             self.input_events.clear()
+        if self.mode == "replaying":
+            if any(event["name"] == "reset" and event["down"] for event in events):
+                self.operator.cancel_requested = True
+            self._reject_events(events, "Replay running; teleoperation and recording are suspended")
+            self.operator.tick(now)
+            return
         if self.mode == "fault":
             self._reject_events(events, "Fault; restart the program before operating")
             return
+        if self.mode == "recovery":
+            self._recovery_tick(now, events)
+            return
         if self.recorder.error:
             raise RuntimeError(self.recorder.error)
-        states = self._read(now)
+        try:
+            states = self._read(now)
+        except RecoverableRobotError as error:
+            self._enter_recovery(str(error))
+            return
         with self.input_lock:
             packet = self.packet
             input_age = time.perf_counter() - packet[0] if packet else float("inf")
@@ -438,7 +757,12 @@ class Controller:
         if missing:
             if self.connected:
                 if hardware_missing:
-                    self._fault("Lost: " + "; ".join(missing))
+                    if states is not None:
+                        # RGB loss is an acquisition failure, not a motor emergency.
+                        # Fresh robot feedback permits a powered hold while cameras recover.
+                        self._enter_recovery("Lost: " + "; ".join(missing))
+                    else:
+                        self._fault("Lost: " + "; ".join(missing))
                 else:
                     self._pause_input(states, "Lost: " + "; ".join(input_missing), required_hands)
                     self._reject_events(events, self.message)
@@ -478,6 +802,7 @@ class Controller:
         if self.mode == "resetting":
             self._reset_tick(states, now)
             return
+        self.operator.result = ""
         self.commands_started = True
         for side in ARMS:
             hand, previous = data[side], self.previous_hands.get(side)
@@ -503,7 +828,7 @@ class Controller:
                     self._notify("rejected", f"{side}: {self.cartesian_blocked[side]}")
                 else:
                     self.message = f"{side}: hold; move controller to follow"
-            if (pressed and not self.cartesian_blocked[side]) or (released_hand and self.enabled[side]):
+            if pressed and not self.cartesian_blocked[side]:
                 # Replace any old trajectory BEFORE enabling. No Cartesian IK on the clutch edge.
                 joints = list(states[side]["joints"])
                 self.last_commands[side] = {"kind": "joint_hold", "joints": joints,
@@ -514,6 +839,13 @@ class Controller:
                     raise RuntimeError(f"{side}: {error}") from error
                 self.motion_active[side] = False
                 self.mappers[side].release(states[side]["vector"])
+            if released_hand:
+                # Freeze the last dispatched pose. Switching P -> J at measured feedback
+                # can pull a still-settling arm backwards and cause a violent stop.
+                command = self.last_commands.get(side, {})
+                held = (command["target"] if command.get("kind") == "cartesian" else
+                        command.get("state", states[side]["vector"]))
+                self.mappers[side].release(held)
             if hand["grip"] and not self.cartesian_blocked[side] and not self.enabled[side]:
                 self.enable_since[side] = self.enable_since[side] or now
                 self.enabled[side] = bool(self.robots[side].enable())
@@ -535,7 +867,8 @@ class Controller:
             target = self.mappers[side].update(effective, states[side]["vector"], min(dt, .05))
             validate_vector(target, self.cfg["arms"][side])
             if np.linalg.norm(np.array(target[:3]) - states[side]["vector"][:3]) > self.cfg["max_position_tracking_error_m"]:
-                raise RuntimeError(f"{side}: robot cannot follow target")
+                self._enter_recovery(f"{side}: robot cannot follow target")
+                return
             anchor = self.mappers[side].anchor
             if effective["grip"] and anchor is not None:
                 origin_p, origin_r, _ = anchor
@@ -545,6 +878,10 @@ class Controller:
                          or hand_rotation.magnitude() > np.deg2rad(3))
                 self.motion_active[side] = self.motion_active[side] or moved
             if effective["grip"] and self.motion_active[side]:
+                issue = self.robots[side].cartesian_start_issue(states[side]["joints"])
+                if issue:
+                    self._enter_recovery(f"{side}: joint limit guard: {issue}")
+                    return
                 self.last_commands[side] = {"kind": "cartesian", "target": list(target),
                     "state": list(states[side]["vector"]), "joints": list(states[side]["joints"])}
                 self.robots[side].send(target)
@@ -563,6 +900,7 @@ class Controller:
 
     def _run(self):
         last = time.perf_counter()
+        deadline = last
         while not self.stop_event.is_set():
             now = time.perf_counter()
             try:
@@ -571,19 +909,43 @@ class Controller:
                 LOG.info("Control fault details", exc_info=True)
                 self._fault(str(error))
             last = now
-            time.sleep(max(0, 1/self.cfg["control_hz"] - (time.perf_counter()-now)))
+            deadline += 1 / self.cfg["control_hz"]
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                deadline = time.perf_counter()  # Never burst old motion commands to catch up.
+            else:
+                time.sleep(remaining)  # Python's high-resolution Windows timer, unlike Event.wait.
 
     def close(self):
         self.stop_event.set()
         if hasattr(self, "thread"):
             self.thread.join(timeout=8)
-        # Stop robots before waiting for any disk writes.
+        # Cancel outstanding trajectories without cutting motor power on a normal exit.
+        # Fault handling already stopped the robots; never replace its emergency stop.
         for robot in self.robots.values():
             try:
-                if self.commands_started:
-                    robot.stop()
+                if self.commands_started and self.mode not in ("fault", "recovery"):
+                    if hasattr(self, "thread") and self.thread.is_alive():
+                        raise RuntimeError("Control thread did not stop before shutdown hold")
+                    sample = robot.read()
+                    if sample is None:
+                        raise RuntimeError("No robot feedback for shutdown hold")
+                    _, state = sample
+                    now = time.perf_counter()
+                    stamps = state["source_timestamps"]
+                    if not stamps or any(not -.05 <= now-stamp <= self.cfg["feedback_timeout_s"]
+                                         for stamp in stamps.values()):
+                        raise RuntimeError("Stale robot feedback for shutdown hold")
+                    robot.hold(list(state["joints"]))
+                    # The SDK gripper command enables its motor; preserve a disabled gripper.
+                    if state.get("gripper_enabled", False):
+                        robot.send_gripper(state["vector"][7])
             except Exception:
-                LOG.exception("Shutdown stop failed")
+                LOG.exception("Shutdown hold failed; requesting emergency stop")
+                try:
+                    robot.stop()
+                except Exception:
+                    LOG.exception("Shutdown emergency stop failed")
             try:
                 robot.close()
             except Exception:

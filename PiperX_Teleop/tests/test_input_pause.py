@@ -151,7 +151,7 @@ def test_active_hand_pause_can_resume_with_unused_other_hand_missing(cfg):
     assert control.mode == "idle"
 
 
-def test_camera_failure_during_input_pause_still_latches_fault(cfg, monkeypatch):
+def test_camera_failure_during_input_pause_requires_recovery_without_dropping_power(cfg, monkeypatch):
     control = make_controller(cfg)
     step(control, neutral_packet())
     control.disconnect()
@@ -161,10 +161,10 @@ def test_camera_failure_during_input_pause_still_latches_fault(cfg, monkeypatch)
         monkeypatch.setattr(robot, "stop", lambda side=side: stopped.append(side))
     control.cameras.errors["head"] = "camera unplugged"
     step(control, neutral_packet())
-    assert control.mode == "fault" and set(stopped) == set(ARMS)
+    assert control.mode == "recovery" and stopped == []
     control.cameras.errors.clear()
     step(control, neutral_packet())
-    assert control.mode == "fault"
+    assert control.mode == "recovery"  # Camera return must not resume old input automatically.
 
 
 @pytest.mark.parametrize("failure", ["hold", "read"])

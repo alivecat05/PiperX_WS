@@ -4,8 +4,8 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>PiperX Quest 遥操</title>
 <style>
-body{font:18px system-ui;background:#101419;color:#e6edf3;margin:30px;max-width:1000px}
-button{font:inherit;padding:14px 22px;cursor:pointer}canvas{display:block;width:100%;margin-top:20px}
+body{font:18px system-ui;background:#fff;color:#172033;margin:30px;max-width:1000px}
+button{font:inherit;padding:14px 22px;cursor:pointer;background:#f8fafc;color:#172033;border:1px solid #cbd5e1;border-radius:6px}canvas{display:block;width:100%;margin-top:20px}
 #status{white-space:pre-line;line-height:1.7}p{line-height:1.7}
 </style>
 <h1>PiperX 双臂遥操</h1>
@@ -14,6 +14,8 @@ button{font:inherit;padding:14px 22px;cursor:pointer}canvas{display:block;width:
 食指扳机：按下闭合夹爪，松开张开（独立于中指键）</p>
 <p>松开两个中指键、等待录制保存完成后：Y 长按 1.5 秒复位；X 长按 2 秒保存当前初始位。<br>
 复位过程中：松开 Y，再按一次 Y 取消复位。</p>
+<p>越限或跟踪误差进入 recovery 时：程序请求原位保持并暂停采集。可用机械臂本体示教按钮手动调整，退出示教后，松开手柄按键和扳机 0.3 秒，再长按 Y 1.5 秒（或在电脑窗口按 R）申请恢复。<br>
+配置为 v189 时，电脑窗口「恢复遥操」也可主动退出示教并请求保持当前位置，等待控制器反馈确认。确认状态正常后，松开按键，再重新按中指键接管。示教期间除显式退出请求外，程序停止发送运动指令，不会自动 reset 或失能。</p>
 <p>挂脖采集：先用 USB 连接电脑并运行 teleop.cmd awake，无需 MQDH；确认离脸后手柄仍被追踪。<br>
 采集时看真实场景，三路 RGB 和录制状态显示在电脑窗口；头显保持追踪即可。</p>
 <button id="enter">启动手柄追踪</button>

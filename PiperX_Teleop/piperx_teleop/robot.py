@@ -10,6 +10,14 @@ from .core import pose_to_vector, vector_to_pose
 RECOVERABLE_STATUSES = (0, 1, 4)  # NORMAL, EMERGENCY_STOP, TARGET_POS_EXCEEDS_LIMIT
 
 
+class RecoverableRobotError(RuntimeError):
+    """A target rejection or operator teaching mode, without motor error bits."""
+
+
+def status_number(value):
+    return int(getattr(value, "value", value))
+
+
 class PiperX:
     def __init__(self, cfg):
         from pyAgxArm import AgxArmFactory, ArmModel, create_agx_arm_config
@@ -37,15 +45,30 @@ class PiperX:
         return stamp
 
     def read(self):
+        return self._read_feedback(allow_recovery=False)
+
+    def read_recovery(self):
+        return self._read_feedback(allow_recovery=True)
+
+    def _read_feedback(self, allow_recovery):
         pose = self.robot.get_tcp_pose()
         joints = self.robot.get_joint_angles()
         grip = self.gripper.get_gripper_status()
         status = self.robot.get_arm_status()
         if any(x is None for x in (pose, joints, grip, status)):
             return None
-        if status.msg.arm_status.value != 0 or status.msg.err_code != 0:
+        code = status_number(status.msg.arm_status)
+        control_mode = status_number(getattr(status.msg, "ctrl_mode", 1))
+        teach_status = status_number(getattr(status.msg, "teach_status", 0))
+        # teach_status may retain the last teaching command after CAN control resumes.
+        teaching = control_mode in (2, 6) or code in (11, 13)
+        teaching |= teach_status == 1 and control_mode != 1
+        recoverable = not status.msg.err_code and (code == 4 or (teaching and code in (0, 11, 13)))
+        if recoverable and not allow_recovery:
+            raise RecoverableRobotError(f"Robot needs recovery: {status.msg.arm_status}; teaching={teaching}")
+        if status.msg.err_code or (code != 0 and not recoverable):
             logging.getLogger(__name__).info("Robot status: %s", status.msg)
-            if status.msg.arm_status.value == 1:
+            if code == 1:
                 raise RuntimeError("机械臂处于急停；放稳并支撑机械臂后运行 .\\teleop.cmd recover --supported")
             raise RuntimeError(f"Robot error: {status.msg.arm_status}, code=0x{status.msg.err_code:04x}")
         if grip.msg.mode != "width":
@@ -65,6 +88,12 @@ class PiperX:
             "joints": list(joints.msg), "source_timestamps": fields,
             "gripper_enabled": bool(grip.msg.foc_status.driver_enable_status),
             "gripper_status": int(grip.msg.status_code),
+            "arm_status": code, "err_code": int(status.msg.err_code),
+            "teaching": teaching, "ctrl_mode": control_mode, "teach_status": teach_status,
+            "mode_feedback": status_number(getattr(status.msg, "mode_feedback", 0)),
+            "arm_enabled": (bool(self.robot.get_joint_enable_status(255))
+                            if hasattr(self.robot, "get_joint_enable_status") else None),
+            "teach_exit_supported": getattr(self, "cfg", {}).get("firmware") == "v189",
         }
 
     def enable(self):
@@ -99,9 +128,15 @@ class PiperX:
         raise TimeoutError("控制器故障仍未清除；请检查物理急停和控制器状态")
 
     def send(self, vector):
+        self.send_pose(vector)
+        self.send_gripper(vector[7])
+
+    def send_pose(self, vector):
         flange = self.robot.get_tcp2flange_pose(vector_to_pose(vector))
         self.robot.move_p(list(flange))
-        self.send_gripper(vector[7])
+
+    def set_motion_speed(self, percent):
+        self.robot.set_speed_percent(percent)
 
     def send_gripper(self, width):
         self.gripper.move_gripper_m(float(width), force=self.cfg["gripper_force_n"])
@@ -123,6 +158,10 @@ class PiperX:
         return ""
 
     def hold(self, joints):
+        self._validate_hold_joints(joints)
+        self.robot.move_j(list(joints))
+
+    def _validate_hold_joints(self, joints):
         if np.asarray(joints).shape != (6,) or not np.isfinite(joints).all():
             raise ValueError("保持位置需要六个有效的实测关节角")
         # Only an enabled SDK software limit clamps move_j. Presets alone are not active limits.
@@ -134,6 +173,14 @@ class PiperX:
                 if not low <= angle <= high:
                     raise ValueError(f"机械臂实测 J{index}={angle:.4f} rad 超出已启用的软件限位"
                                      f" [{low:.4f}, {high:.4f}]；无法原位接管")
+
+    def exit_teaching(self, joints):
+        """Explicit v189 seamless exit; never reset, disable, replay or home."""
+        if self.cfg["firmware"] != "v189":
+            raise ValueError("当前仅支持 v189 固件的无断电退出示教；请先使用本体退出，软件不会自动 reset")
+        self._validate_hold_joints(joints)  # Validate before leaving compliant teaching mode.
+        from pyAgxArm.protocols.can_protocol.msgs.piper.default.transmit.arm_motion_ctrl import ArmMsgMotionCtrl
+        self.robot._send_msg(ArmMsgMotionCtrl(track_ctrl=6, grag_teach_ctrl=2))
         self.robot.move_j(list(joints))
 
     def stop(self):
@@ -152,13 +199,25 @@ class MockPiperX:
     def read(self):
         t = time.perf_counter()
         return t, {"vector": list(self.vector), "joints": list(self.joints),
-                   "source_timestamps": dict.fromkeys(("tcp", "joints", "gripper", "status"), t)}
+                   "source_timestamps": dict.fromkeys(("tcp", "joints", "gripper", "status"), t),
+                   "arm_status": 0, "err_code": 0, "teaching": False,
+                   "ctrl_mode": 1, "mode_feedback": 1, "arm_enabled": True,
+                   "teach_exit_supported": True}
+
+    def read_recovery(self):
+        return self.read()
 
     def enable(self):
         return True
 
     def send(self, vector):
         self.vector = list(vector)
+
+    def send_pose(self, vector):
+        self.vector[:7] = list(vector[:7])
+
+    def set_motion_speed(self, percent):
+        pass
 
     def send_gripper(self, width):
         self.vector[7] = float(width)
@@ -169,6 +228,9 @@ class MockPiperX:
 
     def hold(self, joints):
         self.joints = list(joints)
+
+    def exit_teaching(self, joints):
+        self.hold(joints)
 
     def cartesian_start_issue(self, joints):
         return ""

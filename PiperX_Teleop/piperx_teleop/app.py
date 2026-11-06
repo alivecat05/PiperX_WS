@@ -87,6 +87,18 @@ def load_config(path):
     if cfg["sync"]["delay_ms"] < cfg["sync"]["camera_tolerance_ms"]:
         raise ValueError("Synchronization delay must cover the camera matching tolerance")
     for arm in cfg["arms"].values():
+        if not np.isfinite(arm["position_scale"]) or not 0 < arm["position_scale"] <= 5:
+            raise ValueError("position_scale must be > 0 and <= 5 (hand displacement multiplier)")
+        for key, default, maximum in (("pose_smoothing_s", 0., .5),
+                                      ("position_deadband_m", .001, .02),
+                                      ("rotation_deadband_rad", .008726646, .2)):
+            arm.setdefault(key, default)
+            if not np.isfinite(arm[key]) or not 0 <= arm[key] <= maximum:
+                raise ValueError(f"Invalid {key}: expected 0 <= value <= {maximum}")
+        if not np.isfinite(arm["max_speed_m_s"]) or arm["max_speed_m_s"] <= 0:
+            raise ValueError("max_speed_m_s must be finite and positive")
+        if type(arm["speed_percent"]) is not int or not 1 <= arm["speed_percent"] <= 100:
+            raise ValueError("speed_percent must be an integer from 1 to 100")
         for waypoint in arm["home_waypoints"]:
             if np.asarray(waypoint).shape != (6,) or not np.isfinite(waypoint).all():
                 raise ValueError("Each home waypoint must contain six finite joint angles in radians")
@@ -298,9 +310,16 @@ async def run(args, cfg):
         print("B: 开始录制 | A: 保存 | 中指键: 按住使能跟随/松开保持 | 食指扳机: 夹爪闭合/张开 | Y长按: 回初始位 | X长按: 保存初始位", flush=True)
         if not args.no_preview:
             preview = Preview(" | INPUT TEST - ROBOTS DISCONNECTED" if input_test else "")
+            preview.operation_handler = controller.operator.request
         while True:
             if preview and not preview.update(cameras, controller.status()):
                 break
+            if preview and getattr(preview, "recover_requested", False):
+                controller.request_recovery()
+                preview.recover_requested = False
+            while preview and getattr(preview, "commands", None):
+                operation, arguments = preview.commands.popleft()
+                controller.operator.request(operation, **arguments)
             await asyncio.sleep(.03)
     finally:
         if controller:
@@ -329,7 +348,7 @@ def main():
     parser.add_argument("--config", default="config.json")
     parser.add_argument("--mock", action="store_true")
     parser.add_argument("--input-test", action="store_true", help="Real RGB + Quest diagnostics; no robot connection or commands")
-    parser.add_argument("--transport", choices=("wifi", "usb"), default="wifi")
+    parser.add_argument("--transport", choices=("wifi", "usb"), default="usb", help="Quest connection transport (default: usb)")
     bundled_adb = Path(__file__).resolve().parents[1] / ".setup/platform-tools/adb.exe"
     parser.add_argument("--adb", default=str(bundled_adb) if bundled_adb.is_file() else "adb",
                         help="Android platform-tools adb.exe path")

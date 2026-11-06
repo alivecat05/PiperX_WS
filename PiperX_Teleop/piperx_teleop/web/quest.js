@@ -106,7 +106,6 @@ enter.onclick = async () => {
     reference.addEventListener("reset", () => session?.end());
     session.addEventListener("end", () => { session=null; ws?.close(); enter.disabled=false; });
     await connect();
-    let lastSent = 0;
     function tick(now,frame) {
       if (!session) return;
       session.requestAnimationFrame(tick);
@@ -126,7 +125,8 @@ enter.onclick = async () => {
       // Do not bypass focus/tracking checks when the headset sleeps or loses tracking.
       const viewer = Boolean(frame.getViewerPose(reference));
       const active = session.visibilityState === "visible" && viewer;
-      if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount === 0 && now-lastSent >= 15) {
+      // Send each available XR frame; a 15 ms gate halves a 90 Hz session to 45 Hz.
+      if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount === 0) {
         const fresh = performance.now()-lastAck < 180;
         const inactive_reason = !fresh ? "server_ack_stale" : session.visibilityState === "hidden"
           ? "session_hidden" : session.visibilityState !== "visible" ? "session_blurred"
@@ -136,7 +136,6 @@ enter.onclick = async () => {
           server_time_s:serverTime,left,right,
           buttons,events:pendingEvents.map(({id,name,down,created}) => ({id,name,down,
             age_ms:Math.max(0,performance.now()-created)}))}));
-        lastSent = now;
       }
       // Submit a blank XR frame; no RGB is fetched, encoded or uploaded to the headset.
       gl.bindFramebuffer(gl.FRAMEBUFFER,session.renderState.baseLayer.framebuffer);

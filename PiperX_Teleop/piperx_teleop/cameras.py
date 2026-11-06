@@ -9,6 +9,19 @@ import numpy as np
 from .core import CAMERAS, History
 
 
+def frame_timestamp(timestamp_ms, domain, receive, wall_offset, latency_ms=0):
+    """Use SDK global/system timestamps; a raw hardware clock is not host Unix time."""
+    domain = str(domain).rsplit(".", 1)[-1]
+    if domain in ("global_time", "system_time"):
+        stamp, basis = timestamp_ms / 1000 + wall_offset, domain
+    else:
+        stamp, basis = receive, "host_receive"
+    stamp -= latency_ms / 1000
+    if not np.isfinite(stamp) or abs(stamp-receive) > 1:
+        raise RuntimeError("Camera timestamp mapping changed by >1 second or is invalid")
+    return stamp, basis
+
+
 def rs_context(settings):
     import pyrealsense2 as rs
     return rs.context(json.dumps(settings))
@@ -59,6 +72,7 @@ class Cameras:
             cfg = self.cfg["cameras"][name]
             if self.mock:
                 index = 0
+                deadline = time.perf_counter()
                 while not self.stop_event.is_set():
                     t = time.perf_counter()
                     image = np.zeros((cfg["height"], cfg["width"], 3), np.uint8)
@@ -68,7 +82,10 @@ class Cameras:
                                                 "device_ms": t * 1000, "clock": "mock",
                                                 "timestamp_basis": "host_monotonic", "receive_s": t})
                     index += 1
-                    time.sleep(max(0, 1 / cfg["fps"] - (time.perf_counter() - t)))
+                    deadline += 1 / cfg["fps"]
+                    if deadline < time.perf_counter():
+                        deadline = time.perf_counter()
+                    time.sleep(max(0, deadline-time.perf_counter()))
                 return
             import pyrealsense2 as rs
             pipe = rs.pipeline(self.context)
@@ -82,6 +99,9 @@ class Cameras:
             for sensor in profile.get_device().query_sensors():
                 if sensor.supports(rs.option.global_time_enabled):
                     sensor.set_option(rs.option.global_time_enabled, 1)
+                # Do not trade exposure for a lower actual FPS in a dark scene.
+                if sensor.supports(rs.option.auto_exposure_priority):
+                    sensor.set_option(rs.option.auto_exposure_priority, 0)
             for _ in range(30):
                 pipe.wait_for_frames(3000)
             wall_offset = time.perf_counter() - time.time()
@@ -90,12 +110,7 @@ class Cameras:
                 receive = time.perf_counter()
                 domain = frame.get_frame_timestamp_domain()
                 device_ms = frame.get_timestamp()
-                basis = "global_time" if domain == rs.timestamp_domain.global_time else "host_receive"
-                # Never compare the hardware clocks of different cameras directly.
-                stamp = device_ms / 1000 + wall_offset if basis == "global_time" else receive
-                stamp -= cfg["latency_ms"] / 1000
-                if abs(stamp - receive) > 1:
-                    raise RuntimeError(f"{name}: timestamp mapping changed by >1 second")
+                stamp, basis = frame_timestamp(device_ms, domain, receive, wall_offset, cfg["latency_ms"])
                 self.histories[name].add(stamp, {"bgr": np.asanyarray(frame.get_data()).copy(),
                     "frame_number": frame.get_frame_number(), "device_ms": device_ms,
                     "clock": str(domain), "timestamp_basis": basis, "receive_s": receive})
