@@ -38,4 +38,4 @@ PiperCapture/outputs/pick_cup/episode_001/
 
 默认读取 `PiperCapture/outputs/`，输出到 `PiperCapture/datasets/pipercapture/`。
 
-仓库包含代码、测试、SDK 源码及许可证、配置示例和安装脚本；不包含本地 Conda、录制数据、证书、缓存及设备配置。
+仓库包含代码、测试、SDK 源码及许可证、配置示例和安装脚本，以及 HumanCapture 和 PiperX_Teleop 当前的 `config.json`（相机序列号、采集参数、踏板绑定及遥操配置），方便迁移到新电脑继续使用同一套硬件。PiperCapture 的本机配置仍单独保留。不包含本地 Conda、录制数据、证书及缓存。

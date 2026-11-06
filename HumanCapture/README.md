@@ -14,7 +14,7 @@ cd D:\Piper_WS\PiperX_WS\HumanCapture
 
 当前工作区可直接复用旁边 PiperX_Teleop 的 Python 环境。也可先运行 `.\setup.cmd`，创建独立 `.venv` 并安装依赖；没有旁边的环境时，需要先安装包含 Tk 的 Python 3.12。
 
-把 `config.example.json` 复制为 `config.json`（setup 会自动复制），在 `cameras` 中填入三台相机各自的序列号。`discover` 列出 SDK 可见设备及实际 RGB 模式。D555 默认 DDS domain 0、896×504@30；双腕默认 640×480@30，`model: D405` 可以匹配包含 D405 的设备型号。以实际枚举结果为准，不会静默换用低帧率模式。三台相机均开启后才允许录制。
+仓库已包含当前设备的 `config.json`，保留三台相机序列号、采集参数和已识别的踏板键（当前 F8）；迁移到新电脑继续使用同一套硬件时可直接沿用，setup 不覆盖已有配置。更换相机时更新 `cameras` 中的序列号。缺少配置时可复制 `config.example.json`（setup 会自动复制）。`discover` 列出 SDK 可见设备及实际 RGB 模式。配置示例为 DDS domain 0、D555 896×504@30、双腕 640×480@30；当前设备配置使用 D555 1280×800@30、双腕 1280×720@30。`model: D405` 可以匹配包含 D405 的设备型号。以实际枚举结果为准，不会静默换用低帧率模式。三台相机均开启后才允许录制。
 
 只测试软件而不连接设备：
 

@@ -1,0 +1,177 @@
+{
+  "control_hz": 60,
+  "record_hz": 30,
+  "task": "dual arm manipulation",
+  "feedback": {
+    "sound": true,
+    "haptics": true
+  },
+  "output": "outputs/episodes",
+  "input_timeout_s": 0.2,
+  "feedback_timeout_s": 0.15,
+  "camera_timeout_s": 0.25,
+  "max_position_tracking_error_m": 0.1,
+  "reset_timeout_s": 20,
+  "sync": {
+    "delay_ms": 80,
+    "camera_tolerance_ms": 33.333333333333336,
+    "camera_span_ms": 33.333333333333336,
+    "state_tolerance_ms": 33.333333333333336,
+    "action_max_age_ms": 33.333333333333336,
+    "require_sdk_timestamps": true
+  },
+  "realsense": {
+    "dds": {
+      "enabled": true,
+      "domain": 0
+    }
+  },
+  "cameras": {
+    "head": {
+      "model": "D555",
+      "serial": "419222301962",
+      "width": 1280,
+      "height": 800,
+      "fps": 30,
+      "latency_ms": 0
+    },
+    "left_wrist": {
+      "model": "D405",
+      "serial": "409122271019",
+      "width": 1280,
+      "height": 720,
+      "fps": 30,
+      "latency_ms": 0
+    },
+    "right_wrist": {
+      "model": "D405",
+      "serial": "409122273120",
+      "width": 1280,
+      "height": 720,
+      "fps": 30,
+      "latency_ms": 0
+    }
+  },
+  "arms": {
+    "left": {
+      "interface": "agx_cando",
+      "channel": "1",
+      "firmware": "v189",
+      "tcp_offset": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "home_waypoints": [
+        [
+          -0.011397000015522973,
+          0.29075440008973535,
+          -0.27047367418156126,
+          0.33838443537666063,
+          -0.1696809098788887,
+          -0.023806290997202658
+        ]
+      ],
+      "xr_to_base": [
+        [
+          0,
+          0,
+          -1
+        ],
+        [
+          -1,
+          0,
+          0
+        ],
+        [
+          0,
+          1,
+          0
+        ]
+      ],
+      "workspace_min": [
+        0.05,
+        -0.4,
+        0.05
+      ],
+      "workspace_max": [
+        0.6,
+        0.4,
+        0.65
+      ],
+      "position_scale": 1.1,
+      "max_speed_m_s": 0.5,
+      "max_rotation_rad_s": 0.6,
+      "gripper_max_m": 0.1,
+      "gripper_force_n": 1.0,
+      "speed_percent": 100,
+      "reset_speed_percent": 10,
+      "pose_smoothing_s": 0.3,
+      "position_deadband_m": 0.001,
+      "rotation_deadband_rad": 0.008726646
+    },
+    "right": {
+      "interface": "agx_cando",
+      "channel": "0",
+      "firmware": "v189",
+      "tcp_offset": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "home_waypoints": [
+        [
+          -0.03595378259108319,
+          0.443523069516799,
+          -0.353656066331611,
+          0.21572269554649912,
+          0.0,
+          -0.06695083010650249
+        ]
+      ],
+      "xr_to_base": [
+        [
+          0,
+          0,
+          -1
+        ],
+        [
+          -1,
+          0,
+          0
+        ],
+        [
+          0,
+          1,
+          0
+        ]
+      ],
+      "workspace_min": [
+        0.05,
+        -0.4,
+        0.05
+      ],
+      "workspace_max": [
+        0.6,
+        0.4,
+        0.65
+      ],
+      "position_scale": 1.1,
+      "max_speed_m_s": 0.5,
+      "max_rotation_rad_s": 0.6,
+      "gripper_max_m": 0.1,
+      "gripper_force_n": 1.0,
+      "speed_percent": 100,
+      "reset_speed_percent": 10,
+      "pose_smoothing_s": 0.3,
+      "position_deadband_m": 0.001,
+      "rotation_deadband_rad": 0.008726646
+    }
+  }
+}

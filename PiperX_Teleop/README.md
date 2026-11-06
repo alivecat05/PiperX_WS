@@ -27,7 +27,7 @@ cd PiperX_Teleop
 .\teleop.cmd discover
 ```
 
-编辑自动生成的 `config.json`：
+仓库已包含当前硬件的 `config.json`，保留相机序列号、CAN 映射、复位航点和遥操参数。新电脑使用同一套硬件时可沿用；安装脚本不覆盖已有配置。更换硬件时编辑 `config.json`：
 
 - `cameras.*.serial`：填头部、左腕、右腕相机序列号。
 - `arms.*.channel`：核对左右 USB-CAN 编号；示例左 1、右 0。

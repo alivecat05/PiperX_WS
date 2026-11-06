@@ -186,6 +186,5 @@ cython_debug/
 /certs/
 /outputs/
 /datasets/
-/config.json
 *.pem
 *.key
