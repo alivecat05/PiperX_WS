@@ -1,0 +1,13 @@
+diff --git a/src/python/isaaccapture_egopost/inference/pipeline/predictor.py b/src/python/isaaccapture_egopost/inference/pipeline/predictor.py
+index 062bde6..f2407b8 100644
+--- a/src/python/isaaccapture_egopost/inference/pipeline/predictor.py
++++ b/src/python/isaaccapture_egopost/inference/pipeline/predictor.py
+@@ -73,7 +73,7 @@ def load_egohand_model(checkpoint_path: str | Path, soma_hand_data_folder: str |
+         model: EgoHand instance in eval mode on CPU.
+         target: The ``_target_`` string from the checkpoint cfg (for logging).
+     """
+-    ckpt = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
++    ckpt = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False, mmap=True)
+     cfg = OmegaConf.create(ckpt["hyper_parameters"]["cfg"])
+     target = str(cfg.get("_target_", ""))
+     if not any(target.endswith(t) for t in _VALID_TARGETS):

@@ -1,0 +1,8 @@
+# Optional ACE comparison only; install the main environment first.
+diffusers==0.36.0
+transformers==4.57.3
+accelerate==1.12.0
+peft==0.18.1
+smplx==0.1.28
+sentencepiece>=0.2,<1
+ftfy>=6,<7

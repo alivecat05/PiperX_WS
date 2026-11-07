@@ -1,4 +1,17 @@
 .venv/
-.mano-venv/
+.*-venv/
+__pycache__/
+.pytest_cache/
 .cache/
 result/
+human demonstration/
+humandemonstrate/
+*.mp4
+*.avi
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.npz
+*.pkl
+!tests/fixtures/*.npz

@@ -1,0 +1,153 @@
+{
+  "checked_at": "2026-11-07 Asia/Shanghai",
+  "selection_basis": "Public code and obtainable weights; evaluate the same 5033 source frames. Citation count is not a performance metric.",
+  "citation_counts": {
+    "status": "database_snapshot_available",
+    "database": "OpenAlex",
+    "checked_at": "2026-11-07 Asia/Shanghai",
+    "records": [
+      {
+        "method": "HaMeR",
+        "id": "https://openalex.org/W4402704593",
+        "title": "Reconstructing Hands in 3D with Transformers",
+        "publication_year": 2024,
+        "cited_by_count": 174,
+        "doi": "https://doi.org/10.1109/cvpr52733.2024.00938"
+      },
+      {
+        "method": "WiLoR",
+        "id": "https://openalex.org/W4413144709",
+        "title": "WiLoR: End-to-end 3D Hand Localization and Reconstruction in-the-wild",
+        "publication_year": 2025,
+        "cited_by_count": 65,
+        "doi": "https://doi.org/10.1109/cvpr52734.2025.01143"
+      },
+      {
+        "method": "HaWoR",
+        "id": "https://openalex.org/W4413145923",
+        "title": "HaWoR: World-Space Hand Motion Reconstruction from Egocentric Videos",
+        "publication_year": 2025,
+        "cited_by_count": 9,
+        "doi": "https://doi.org/10.1109/cvpr52734.2025.00175"
+      },
+      {
+        "method": "ACE-Ego-Hand",
+        "id": "https://openalex.org/W7203900757",
+        "title": "ACE-Ego-Hand: Repurposing Video Diffusion Models for Occlusion-Robust Egocentric 3D Hand Motion Recovery",
+        "publication_year": 2026,
+        "cited_by_count": 0,
+        "doi": "https://doi.org/10.48550/arxiv.2608.20308"
+      },
+      {
+        "method": "EgoHand",
+        "id": "https://openalex.org/W7223320627",
+        "title": "EgoHand: Monocular 3D Hand Reconstruction from Egocentric Video",
+        "publication_year": 2026,
+        "cited_by_count": 0,
+        "doi": "https://doi.org/10.48550/arxiv.2610.30293"
+      },
+      {
+        "method": "StableHand",
+        "id": "https://openalex.org/W7161678892",
+        "title": "StableHand: Quality-Aware Flow Matching for World-Space Dual-Hand Motion Estimation from Egocentric Video",
+        "publication_year": 2026,
+        "cited_by_count": 0,
+        "doi": "https://doi.org/10.48550/arxiv.2605.18553"
+      }
+    ],
+    "limitations": "Counts refer to the returned exact-title records; conference and arXiv versions can be split. New 2026 records have indexing lag. This is not a global most-cited ranking and does not rank model accuracy. Semantic Scholar separately returned HTTP 429."
+  },
+  "candidates": [
+    {
+      "method": "WiLoR/MANO",
+      "year": 2025,
+      "role": "existing single-frame baseline",
+      "code": "https://github.com/warmshao/WiLoR-mini",
+      "status": "full_batch_complete",
+      "processed_frames": 5033,
+      "episodes": 7
+    },
+    {
+      "method": "HaWoR + learned infiller",
+      "year": 2025,
+      "role": "16-frame visual temporal model and 120-frame learned motion completion, fixed head camera",
+      "code": "https://github.com/ThunderVVV/HaWoR",
+      "status": "full_batch_complete",
+      "processed_frames": 5033,
+      "episodes": 7
+    },
+    {
+      "method": "ACE-Ego-Hand K-free",
+      "year": 2026,
+      "paper": "https://arxiv.org/abs/2608.20308",
+      "code": "https://github.com/ggxxii/ACE-Ego-Hand",
+      "role": "detector-free bidirectional video inference, predicts pinhole camera",
+      "status": "full_batch_complete",
+      "published_results": {
+        "HOT3D_MPJPE_p_mm": 13.535,
+        "ARCTIC_MPJPE_p_mm": 16.615,
+        "HOI4D_MPJPE_p_mm": 22.154
+      },
+      "caveat": "Published results are from the authors protocol. They do not measure this unlabeled capture data, and their HaWoR baseline omits infilling and SLAM.",
+      "processed_frames": 5033,
+      "episodes": 7
+    },
+    {
+      "method": "NVIDIA EgoHand",
+      "year": 2026,
+      "paper": "https://arxiv.org/abs/2610.30293",
+      "code": "https://github.com/NVIDIA/IsaacCapture",
+      "role": "SOMA hand reconstruction with DINOv3 and optional tracking",
+      "status": "full_batch_complete",
+      "configuration": "DINOv3-H+ + MHR-identity SOMA, perspective crops, bounded tracking and official adaptive temporal smoothing",
+      "processed_frames": 5033,
+      "episodes": 7
+    },
+    {
+      "method": "StableHand enhanced",
+      "year": 2026,
+      "paper": "https://arxiv.org/abs/2605.18553",
+      "code": "https://github.com/huajian-zeng/stablehand",
+      "status": "excluded_from_custom_video_comparison",
+      "caveat": "Official release exposes inference on precomputed benchmark caches; data preprocessing is still marked TODO. Never substitute fabricated VGGT scene/visual features.",
+      "reason": "The public release has benchmark-cache inference but no custom-video preprocessing. Current RGB videos cannot supply its required scene and quality features without an additional unpublished preprocessing pipeline."
+    },
+    {
+      "method": "FAH",
+      "year": 2026,
+      "paper": "https://arxiv.org/abs/2611.07711",
+      "code": "https://github.com/noahcao/FAH",
+      "status": "excluded_from_this_run",
+      "caveat": "Requires separately gated SAM 3D Body/MHR assets. Model-specific results use different protocols and cannot establish a global ranking.",
+      "reason": "Inference additionally requires gated SAM 3D Body/MHR assets; those are not available in this workspace. Public FAH weights alone are insufficient."
+    },
+    {
+      "method": "ViDiHand",
+      "year": 2026,
+      "code": "https://github.com/NTUYWANG103/ViDiHand",
+      "status": "excluded",
+      "reason": "Official repository says code will be released soon; user excludes code/weight-unavailable methods."
+    },
+    {
+      "method": "DewHand",
+      "year": 2026,
+      "paper": "https://arxiv.org/abs/2610.29936",
+      "project": "https://narusuzuki.github.io/projects/26-dewhand/",
+      "status": "excluded",
+      "reason": "Official project says code coming soon; user excludes code/weight-unavailable methods."
+    }
+  ],
+  "local_refinement": "Optional MANO fitting is implemented separately and must not be called official Dyn-HaMR.",
+  "evaluated_enhancements": [
+    {
+      "method": "ACE + local CUDA temporal fitting",
+      "frames": 5033,
+      "official_Dyn_HaMR_execution": false
+    },
+    {
+      "method": "EgoHand + bounded context crops",
+      "frames": 5033,
+      "selection": "best for this capture batch; qualitative fit and recovered detection gaps, not measured ground-truth accuracy"
+    }
+  ]
+}

@@ -3,7 +3,7 @@
 - [PiperCapture](PiperCapture/README.md)：主从机械臂示教采集，三视角预览、RGB/action 同步、MP4/CSV/JSONL、LeRobot 导出。
 - [PiperX_Teleop](PiperX_Teleop/README.md)：Quest 3 双臂遥操，支持 USB / Wi-Fi。
 - [HumanCapture](HumanCapture/README.md)：人类示范三相机同步采集，白色界面、实时预览、任务序号、MP4 与逐帧时间戳。
-- [HumanLabel](HumanLabel/README.md)：head 估计腕部 epose，wrist 辅助夹爪距离；支持 MediaPipe 基础版和 WiLoR/MANO 分支，输出 action.csv、逐帧掩码和预览。
+- [HumanLabel](HumanLabel/README.md)：EgoHand＋native smoothing＋前后帧裁剪恢复；输出 head 相机系腕部 epose、PiperCapture 格式夹爪距离和完整对比视频。
 
 ## 采集
 

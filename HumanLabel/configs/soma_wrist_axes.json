@@ -1,0 +1,46 @@
+{
+  "schema": "human_label.soma_wrist_axes.v1",
+  "source": "official SOMAHandLayer and BatchedSkinning.forward_kinematics, py-soma-x 0.3.0",
+  "conversion": "R_camera_wrist = A.T @ native_root_rotation @ A; A = (inverse(bind_pose_world[0]) @ t_pose_world[0])[:3,:3]",
+  "A": {
+    "left": [
+      [
+        0.569983184337616,
+        0.6239910125732422,
+        0.534559965133667
+      ],
+      [
+        -0.37194758653640747,
+        0.7760602831840515,
+        -0.5092989206314087
+      ],
+      [
+        -0.7326486706733704,
+        0.09146356582641602,
+        0.6744333505630493
+      ]
+    ],
+    "right": [
+      [
+        0.569980800151825,
+        0.6239809989929199,
+        0.5345742702484131
+      ],
+      [
+        -0.3719397187232971,
+        0.776069164276123,
+        -0.5092911124229431
+      ],
+      [
+        -0.7326545715332031,
+        0.09145673364400864,
+        0.67442786693573
+      ]
+    ]
+  },
+  "asset_sha256": {
+    "SOMAHand.npz": "233e9225c1da05c6a3dd98107b9f027f2366e3b972bbe67e0d164e5d28619fff",
+    "SOMA_neutral.npz": "5829af4a5333abdba5ad449360b868faacee99d395971e62f35c0e7169432b63",
+    "SOMA_template_rig.usda": "a952cb7bdf4ccd801e355d53122d395b985b69d0d9181439edad5081bb171856"
+  }
+}
