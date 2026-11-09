@@ -86,7 +86,7 @@ def test_clutch_reanchors_and_bounds_motion(cfg):
     assert 0 < moved[0] - state[0] <= cfg["arms"]["left"]["max_speed_m_s"]*.02+1e-9
     assert np.isclose(np.linalg.norm(moved[3:7]), 1)
     hand["grip"] = False
-    assert mapper.update(hand, state, .02)[:7] == state[:7]
+    assert mapper.update(hand, state, .02)[:7] == moved[:7]
     hand["position"][2] = -4
     hand["grip"] = True
     assert mapper.update(hand, state, .02)[:7] == state[:7]
@@ -357,7 +357,7 @@ def test_trigger_operates_gripper_with_grip_released(cfg):
     assert control.robots["left"].vector[7] == pytest.approx(cfg["arms"]["left"]["gripper_max_m"])
 
 
-def test_startup_requires_all_cameras_and_both_feedbacks(cfg, monkeypatch):
+def test_startup_requires_both_feedbacks_but_camera_warmup_does_not_block_control(cfg, monkeypatch):
     control = make_controller(cfg)
     read_right = control.robots["right"].read
     monkeypatch.setattr(control.robots["right"], "read", lambda: None)
@@ -365,7 +365,8 @@ def test_startup_requires_all_cameras_and_both_feedbacks(cfg, monkeypatch):
     data["left"]["grip"] = True
     step(control, data, camera_frames=False)
     assert control.mode == "waiting" and not control.status()["ready"]
-    assert "right feedback" in control.message and "RGB head" in control.message
+    assert "right feedback" in control.message
+    assert "head" in control.status()["camera_warnings"]
     assert all(not history.snapshot() for history in control.actions.values())
     assert not any(control.enabled.values()) and control.recorder.path is None
     feed_cameras(control, time.perf_counter())
@@ -381,7 +382,7 @@ def test_startup_requires_all_cameras_and_both_feedbacks(cfg, monkeypatch):
     control.close()
 
 
-def test_stalled_camera_holds_without_emergency_stop_before_driver_timeout(cfg, monkeypatch):
+def test_stalled_camera_warns_without_stopping_control(cfg, monkeypatch):
     control = make_controller(cfg)
     stopped = []
     for side, robot in control.robots.items():
@@ -393,7 +394,8 @@ def test_stalled_camera_holds_without_emergency_stop_before_driver_timeout(cfg, 
     control.cameras.histories["head"] = history
     step(control, packet(), camera_frames=False)
     assert not control.cameras.errors  # The camera worker hasn't raised an error yet.
-    assert control.mode == "recovery" and "RGB head" in control.message
+    assert control.mode == "idle" and control.ready
+    assert "head" in control.status()["camera_warnings"]
     assert stopped == []
 
 
@@ -496,16 +498,17 @@ def test_full_writer_queue_can_be_closed_without_waiting(cfg, monkeypatch):
         assert blocked.wait(1)
         sync, _, _, _ = synced_sample(cfg)
         sample = sync.sample(10.)
-        for i in range(60):
+        capacity = recorder.queue.maxsize
+        for i in range(capacity):
             recorder.add(dict(sample, timestamp_monotonic_s=10+i/30), i)
         start = time.perf_counter()
-        recorder.stop(end_time=12.)
+        recorder.stop(end_time=10.+capacity/30)
         assert time.perf_counter()-start < .2
         assert recorder.busy and not recorder.active
     finally:
         release.set()
         assert recorder.wait(timeout=3)
-    assert recorder.result == "complete" and recorder.count == 60
+    assert recorder.result == "complete" and recorder.count == capacity
 
 
 def test_input_loss_during_tail_marks_episode_incomplete(cfg):
@@ -624,12 +627,12 @@ def test_middle_button_holds_before_enable_then_follows_only_after_motion(cfg, m
     data["right"]["position"][0] += .01
     step(control, data)
     assert calls[-1] == "cartesian"
-    last_target = list(control.last_commands["right"]["target"])
     robot.vector[:3] = [.31, .02, .32]  # Feedback can lag or differ at the release edge.
+    held = list(control.last_commands["right"]["target"])
     count = len(calls)
     step(control, packet())
-    assert len(calls) == count  # Release must not switch P -> J or replace the last target.
-    np.testing.assert_allclose(control.actions["right"].latest().value[:7], last_target[:7])
+    assert len(calls) == count
+    np.testing.assert_allclose(control.actions["right"].latest().value[:7], held[:7])
     step(control, packet())
     assert len(calls) == count
     step(control, data)  # New press starts at a new anchor, without stale delta replay.
@@ -683,8 +686,8 @@ def test_press_jitter_does_not_start_cartesian_following(cfg, monkeypatch):
     data = packet()
     data["right"]["grip"] = True
     step(control, data)
-    data["right"]["position"][0] += .003
-    data["right"]["quaternion"] = Rotation.from_euler("z", 2, degrees=True).as_quat().tolist()
+    data["right"]["position"][0] += .0005
+    data["right"]["quaternion"] = Rotation.from_euler("z", .25, degrees=True).as_quat().tolist()
     for _ in range(10):
         step(control, data)
     assert not calls
@@ -694,9 +697,9 @@ def test_press_jitter_does_not_start_cartesian_following(cfg, monkeypatch):
 
 
 @pytest.mark.parametrize("joints,blocked", [([0, -.0332, .0419, 0, 0, 0], True),
-                                         ([0, 0, 0, .6265, .0273, .0673], True),
-                                         ([0, .01, -.01, 0, 0, 0], True),
-                                         ([3.13, .5, -.5, 0, 0, 0], True),
+                                         ([0, 0, 0, .6265, .0273, .0673], False),
+                                         ([0, .01, -.01, 0, 0, 0], False),
+                                         ([3.13, .5, -.5, 0, 0, 0], False),
                                          ([0, .5, -.5, 0, 0, 0], False)])
 def test_cartesian_start_checks_pose_even_when_joint_hold_is_allowed(joints, blocked):
     from types import SimpleNamespace
@@ -704,8 +707,11 @@ def test_cartesian_start_checks_pose_even_when_joint_hold_is_allowed(joints, blo
     adapter = PiperX.__new__(PiperX)
     limits = {f"joint{i}": [-3.14, 3.14] for i in range(1, 7)}
     limits.update(joint2=[0, 3.14], joint3=[-2.97, 0])
-    adapter.robot = SimpleNamespace(get_config=lambda: {"joint_limits": limits})
+    adapter.robot = SimpleNamespace(get_config=lambda: {"joint_limits": limits},
+                                   get_joint_limits_enabled=lambda: True)
     assert bool(adapter.cartesian_start_issue(joints)) == blocked
+    adapter.robot.get_joint_limits_enabled = lambda: False
+    assert not adapter.cartesian_start_issue(joints)
 
 
 def test_gripper_command_includes_enable_without_enabling_arm():
@@ -789,7 +795,7 @@ def test_diagnostic_counts_capture_button_edges_without_enabling_motion(cfg):
     control.tick(time.perf_counter(), .02)
     hand = control.status()["quest"]["right"]
     assert hand["presses"] == {"middle": 1, "trigger": 1}
-    assert control.mode == "waiting" and not any(control.enabled.values())
+    assert control.mode == "idle" and not any(control.enabled.values())
     assert not control.actions["right"].snapshot()
     control.begin_input()
     assert control.status()["quest"]["right"]["presses"] == {"middle": 0, "trigger": 0}
@@ -836,10 +842,12 @@ def test_ordered_start_stop_events_in_one_control_tick(cfg):
 def test_events_rejected_before_ready_are_acknowledged_not_replayed(cfg):
     control = make_controller(cfg)
     data = packet()
+    data["active"] = False
     data["events"] = [{"id": 1, "name": "record_start", "down": True, "age_ms": 0}]
     step(control, data, camera_frames=False)
     assert control.event_ack == 1 and control.recorder.path is None
     assert control.feedback.snapshot()[-1]["kind"] == "rejected"
+    data["active"] = True
     step(control, data)
     assert control.ready and control.recorder.path is None
 

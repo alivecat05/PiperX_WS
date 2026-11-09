@@ -72,7 +72,7 @@ def test_waiting_for_neutral_or_enable_has_specific_explanation(cfg):
 
 def test_device_not_ready_prevents_recovery_button(cfg):
     _, status = ready_status(cfg)
-    status["recovery"]["hardware_missing"] = ["RGB head"]
+    status["recovery"]["hardware_missing"] = ["left feedback"]
     assert not recovery_guidance(status)["can_recover"]
 
 

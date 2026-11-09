@@ -4,6 +4,7 @@
 .setup/
 .cache/
 .pytest_cache/
+.validation/
 __pycache__/
 *.py[cod]
 *.egg-info/

@@ -52,11 +52,11 @@ def test_toggle_uses_current_controller_state_and_ignores_saving(cfg):
     control.request("record_toggle", selection=selection)
     control.tick(100.16)
     assert "本次踩踏已忽略" in control.message
-    control.tick(100.25)
+    control.tick(100.15+cfg["sync"]["delay_ms"]/1000+.01)
     assert control.recorder.wait(5)
-    control.tick(100.26)
+    control.tick(100.15+cfg["sync"]["delay_ms"]/1000+.02)
     assert control.recorder.result == "complete" and control.capture.index == 43
-    control.tick(100.27)
+    control.tick(100.15+cfg["sync"]["delay_ms"]/1000+.03)
     assert not control.recording  # Saving-time presses must never start a queued episode.
 
 

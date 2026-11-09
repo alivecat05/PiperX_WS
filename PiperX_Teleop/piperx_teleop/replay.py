@@ -1,5 +1,6 @@
 """Validate recorded TCP action CSVs and interpolate them on their original timeline."""
 import csv
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,6 +33,11 @@ class ReplayTrajectory:
     @classmethod
     def load(cls, filename, cfg):
         path = Path(filename.strip().strip('"')).resolve()
+        manifest = path.parent/"manifest.json"
+        if path.name == "action.csv" and manifest.exists():
+            meta = json.loads(manifest.read_text(encoding="utf-8"))
+            if meta.get("placeholder_frames", 0):
+                raise ValueError("此片段含缺帧占位，不能将占位动作作为真实示教轨迹回放")
         rows = []
         with path.open(encoding="utf-8-sig", newline="") as stream:
             reader = csv.reader(stream)

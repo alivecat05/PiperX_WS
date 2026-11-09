@@ -90,6 +90,7 @@ def load_config(path):
         if not np.isfinite(arm["position_scale"]) or not 0 < arm["position_scale"] <= 5:
             raise ValueError("position_scale must be > 0 and <= 5 (hand displacement multiplier)")
         for key, default, maximum in (("pose_smoothing_s", 0., .5),
+                                      ("tremor_smoothing_s", .04, .2),
                                       ("position_deadband_m", .001, .02),
                                       ("rotation_deadband_rad", .008726646, .2)):
             arm.setdefault(key, default)
@@ -97,6 +98,17 @@ def load_config(path):
                 raise ValueError(f"Invalid {key}: expected 0 <= value <= {maximum}")
         if not np.isfinite(arm["max_speed_m_s"]) or arm["max_speed_m_s"] <= 0:
             raise ValueError("max_speed_m_s must be finite and positive")
+        arm.setdefault("joint_guard_enabled", False)
+        if type(arm["joint_guard_enabled"]) is not bool:
+            raise ValueError("joint_guard_enabled must be boolean")
+        for key, default, maximum in (("joint_limit_slow_margin_deg", 8., 30.),
+                                       ("joint_limit_stop_margin_deg", 1., 5.),
+                                       ("joint_max_speed_rad_s", 2., 4.)):
+            arm.setdefault(key, default)
+            if not np.isfinite(arm[key]) or not 0 < arm[key] <= maximum:
+                raise ValueError(f"Invalid {key}")
+        if arm["joint_limit_stop_margin_deg"] >= arm["joint_limit_slow_margin_deg"]:
+            raise ValueError("Joint stop margin must be smaller than slow margin")
         if type(arm["speed_percent"]) is not int or not 1 <= arm["speed_percent"] <= 100:
             raise ValueError("speed_percent must be an integer from 1 to 100")
         for waypoint in arm["home_waypoints"]:

@@ -1,4 +1,4 @@
-"""RGB failures must not request the motor SDK's damped, power-losing stop."""
+"""RGB quality must never trigger motor recovery or end an active episode."""
 import json
 import time
 
@@ -11,8 +11,8 @@ from test_pipeline import step
 
 
 @pytest.mark.parametrize("camera", CAMERAS)
-@pytest.mark.parametrize("mode", ["idle", "recording", "resetting"])
-def test_rgb_worker_error_holds_both_arms_without_emergency_stop(cfg, camera, mode):
+@pytest.mark.parametrize("mode", ["idle", "teleop", "recording", "resetting"])
+def test_rgb_worker_error_only_warns_and_control_continues(cfg, camera, mode):
     control = controller(cfg)
     control.begin_input()
     step(control, neutral())
@@ -23,26 +23,48 @@ def test_rgb_worker_error_holds_both_arms_without_emergency_stop(cfg, camera, mo
     elif mode == "resetting":
         for arm in cfg["arms"].values(): arm["home_waypoints"] = [[.2]*6]
         control._begin_reset(time.perf_counter())
+    elif mode == "teleop":
+        data = neutral()
+        data["right"]["grip"] = True
+        step(control, data)
+    before = {side: len(robot.calls) for side, robot in control.robots.items()}
     control.cameras.errors[camera] = "USB connection lost"
-    step(control, neutral())
-    assert control.mode == "recovery" and f"RGB {camera}" in control.recovery_reason
-    for robot in control.robots.values():
+    data = neutral()
+    if mode == "teleop":
+        data["right"]["grip"] = True
+        data["right"]["position"][2] -= .02
+    step(control, data)
+    assert control.mode not in ("recovery", "fault")
+    assert camera in control.status()["camera_warnings"]
+    for side, robot in control.robots.items():
         assert robot.power
-        assert robot.calls[-1][0] == "hold"
-        assert not any(call[0] == "stop" for call in robot.calls)
-    step(control, neutral())
-    guide = recovery_guidance(control.status())
-    assert not guide["can_recover"] and "相机" in guide["title"]
-    assert "重新启动程序" in guide["steps"][1]
+        assert not any(call[0] == "stop" for call in robot.calls[before[side]:])
+        if mode != "resetting":
+            assert not any(call[0] == "hold" for call in robot.calls[before[side]:])
+    if mode == "teleop":
+        assert any(call[0] == "send" for call in control.robots["right"].calls[before["right"]:])
+    if mode == "recording":
+        assert control.recorder.active
     control.cameras.errors.clear()
     step(control, neutral())
-    assert control.mode == "recovery"  # No automatic replay of pre-failure input.
+    assert control.mode not in ("recovery", "fault")
     if mode == "recording":
+        control.recorder.stop(complete=False)
         assert control.recorder.wait(3)
         meta = json.loads((control.recorder.path/"manifest.json").read_text())
         assert meta["status"] == "incomplete"
-    if mode == "resetting":
-        assert control.reset_jobs == [] and control.reset_active is None
+
+
+def test_camera_can_be_missing_at_record_start_without_blocking_motor_readiness(cfg):
+    control = controller(cfg)
+    step(control, neutral(), camera_frames=False)
+    assert control.ready and control.mode == "idle"
+    data = neutral()
+    data["buttons"]["record_start"] = True
+    step(control, data, camera_frames=False)
+    assert control.recorder.active and control.status()["camera_warnings"]
+    control.recorder.stop(complete=False)
+    assert control.recorder.wait(3)
 
 
 def test_camera_failure_with_robot_feedback_loss_does_not_use_stale_hold(cfg, monkeypatch):

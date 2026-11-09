@@ -204,7 +204,8 @@ class Preview:
         self.heading.configure(text=title, background=surface, foreground=color)
         self.summary.configure(background=surface, foreground="#334155",
             text=f"任务：{shown['task']}    |    {'当前' if capture['active'] else '下一段'}序号：{shown['index']:03d}"
-                 f"    |    已保存 {status['frames']} 帧    |    丢帧 {status['dropped']}    |    写盘 {status['write_fps']:.1f} FPS")
+                 f"    |    时长 {status['duration_s']:.1f} 秒    |    有效 {status['valid_frames']} 帧 / 占位 {status['placeholder_frames']} 帧"
+                 f"    |    写盘 {status['write_fps']:.1f} FPS")
         self.note.configure(text=capture["error"] or "；".join(status["problems"]) or status["message"])
         for widget in (self.task_entry, self.index_entry, self.auto_check, self.next_button):
             widget.state(["disabled"] if status["busy"] else ["!disabled"])
@@ -215,10 +216,13 @@ class Preview:
             camera = status["cameras"][name]
             clock = {"global_time": "SDK 全局时钟", "system_time": "SDK 系统时钟",
                      "host_monotonic": "模拟时钟", "host_receive": "未同步，不能录制"}.get(camera["clock"], camera["clock"])
-            self.labels[name].configure(text=f"{LABELS[name]}   {camera['fps']:.1f} FPS   帧 {camera['frame_number']}\n{clock}")
-        self.detail.configure(text="30 Hz 采集 · 三路来源时间戳差 ≤33.33 ms · 不重复帧补数\n"
+            self.labels[name].configure(text=f"{LABELS[name]}   {camera['fps']:.1f} FPS   帧 {camera['frame_number']}\n{clock}"
+                +f" · 接收延迟 {camera.get('arrival_delay_ms')} ms · 源缺帧 {camera.get('source_gaps', 0)}"
+                +("\nRGB · 曝光/增益已锁定："+str(camera['exposure_settings']) if camera.get('exposure_settings') else ""))
+        self.detail.configure(text="30 Hz 时间轴 · 掉帧继续录制并保持上帧，缺帧位置明确标记 · 视频时长与采集时长一致\n"
                               +(f"最近输出：{status['path']}    {status['result'] or ''}    "
-                                +str(status["drop_reasons"]) if status["path"] else "任务和序号编辑后自动同步；开始录制使用当前输入。"))
+                                +f"写盘队列 {status['writer_queue']}/{status['writer_queue_capacity']}；缺帧原因 {status['drop_reasons']}"
+                                if status["path"] else "任务和序号编辑后自动同步；开始录制使用当前输入。"))
 
     def refresh(self):
         if self.closing:

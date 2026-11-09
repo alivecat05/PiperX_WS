@@ -51,11 +51,9 @@ def recovery_guidance(status):
         cameras = {"head": "头部相机", "left_wrist": "左腕相机", "right_wrist": "右腕相机"}
         names = [label for key, label in cameras.items()
                  if any(item.startswith("RGB "+key) for item in info["hardware_missing"])]
-        worker_failed = bool(status.get("camera_errors"))
         result.update(title=("、".join(names)+"未就绪，已暂停采集" if names else "设备尚未就绪，暂时不能恢复"), steps=(
             "1. 先确认两臂保持状态，再检查对应相机的 USB 连接、供电和画面更新。",
-            ("2. 相机采集线程已报错，请恢复连接后重新启动程序；不要用机械臂 reset 处理相机故障。"
-             if worker_failed else "2. 等待相机画面恢复；这属于相机问题，不需要对机械臂执行 reset。"),
+            "2. 相机正在自动重连，等待画面恢复；这属于相机问题，不需要对机械臂执行 reset。",
             "3. 相机正常后，松开手柄按键和扳机，再点击「恢复遥操」。"))
         return result
     quest = status["quest"]
@@ -71,8 +69,8 @@ def recovery_guidance(status):
         return result
     if info.get("pose_issues"):
         names = "、".join(SIDES[s] for s in info["pose_issues"])
-        result.update(title=f"{names}关节仍接近限位，请先调整姿态", steps=(
-            f"1. 先扶稳{names}，用本体示教调整到展开的工作姿态，远离关节限位。",
+        result.update(title=f"{names}超出已启用的软件限位，请先调整姿态", steps=(
+            f"1. 先扶稳{names}，用本体示教调整回已启用的软件限位内。",
             "2. 退出示教，松开手柄按键和扳机，再申请恢复。"))
         return result
     if info.get("enabling"):

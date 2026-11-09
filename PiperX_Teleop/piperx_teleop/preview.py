@@ -132,15 +132,23 @@ class Preview:
         self.stop_replay_button.pack(side="left", padx=4)
         self.replay_note = tk.StringVar(master=self.root, value="粘贴 CSV 完整路径后加载；加载不会启动运动。")
         ttk.Label(panel, textvariable=self.replay_note).pack(anchor="w", pady=(5, 0))
+        ttk.Label(panel, text="启动追踪前，让头显正对机械臂基座 X 轴方向；接管时会自动记录当前零点。",
+                  foreground="#005a9e").pack(anchor="w", pady=(5, 0))
         self.message = tk.StringVar(master=self.root)
         self.message_label = ttk.Label(panel, textvariable=self.message, wraplength=1350, foreground="#005a9e")
         self.message_label.pack(anchor="w", pady=(5, 0))
         footer = ttk.Frame(self.root, padding=(12, 6))
         footer.pack(side="bottom", fill="x")
         self.device_text = tk.StringVar(master=self.root)
+        self.camera_warning_text = tk.StringVar(master=self.root)
         self.follow_text = tk.StringVar(master=self.root)
+        self.calibration_text = tk.StringVar(master=self.root)
+        self.motion_warning_text = tk.StringVar(master=self.root)
         ttk.Label(footer, textvariable=self.device_text).pack(anchor="w")
+        ttk.Label(footer, textvariable=self.camera_warning_text, foreground="#9a4d0d", wraplength=1320).pack(anchor="w")
         ttk.Label(footer, textvariable=self.follow_text).pack(anchor="w", pady=3)
+        ttk.Label(footer, textvariable=self.calibration_text, foreground="#005a9e").pack(anchor="w")
+        ttk.Label(footer, textvariable=self.motion_warning_text, foreground="#9a4d0d", wraplength=1320).pack(anchor="w")
         self.show_details = tk.BooleanVar(master=self.root, value=False)
         ttk.Checkbutton(footer, text="显示详细诊断", variable=self.show_details,
                         command=self.toggle_details).pack(anchor="w")
@@ -246,7 +254,7 @@ class Preview:
         shown = capture["active"] or capture
         label = "当前" if capture["active"] else "下一段"
         self.band_task.configure(text=f"任务：{shown['task']}    |    {label}采集序号：{shown['index']:03d}"
-                                 f"    |    已保存 {status['frames']} 帧    |    丢帧 {status['dropped']}")
+                                 f"    |    有效 {status['valid_frames']} 帧 / 占位 {status['placeholder_frames']} 帧")
         selection = self.selection()
         try:
             form_index = int(selection["index"])
@@ -290,14 +298,35 @@ class Preview:
         self.device_text.set(f"相机帧率：头部 {rates['cameras']['head']:.1f} / 左腕 {rates['cameras']['left_wrist']:.1f}"
                              f" / 右腕 {rates['cameras']['right_wrist']:.1f} Hz    |    采集写盘 {rates['recording']:.1f} FPS"
                              f"    |    手柄输入 {quest['hz']:.1f} Hz")
+        camera_names = dict(zip(CAMERAS, ("头部", "左腕", "右腕")))
+        warnings = status.get("camera_warnings", {})
+        self.camera_warning_text.set(("相机提示（遥操与采集继续，缺帧有占位标记）："+
+            "；".join(f"{camera_names[n]}：{reason}" for n, reason in warnings.items())) if warnings else "")
         for name, text in zip(CAMERAS, ("头部相机", "左腕相机", "右腕相机")):
             self.camera_labels[name].configure(text=f"{text}    {rates['cameras'][name]:.1f} FPS")
         follow = "    |    ".join(f"{name}跟踪误差 {status['follow'][side]['position_error_mm']} mm"
                                   + ("（触及限速）" if status['follow'][side]['rate_limited'] else "")
                                   for side, name in (("left", "左臂"), ("right", "右臂")))
         self.follow_text.set(f"位移倍率：左 {scales['left']:.2f} / 右 {scales['right']:.2f}    |    "+follow)
-        self.details_text.set(status["message"]+"\n"+str(status.get("robot_status", {}))+
-                              "\n采集缺帧原因："+str(status["recording_drops"]))
+        calibration = status.get("calibration", {})
+        self.calibration_text.set("接管参考："+"    |    ".join(
+            name+("：本次已对齐" if calibration.get(side, {}).get("calibrated") else "：按中指记录当前零点")
+            for side, name in (("left", "左臂"), ("right", "右臂"))))
+        motion_notes = []
+        for side, name in (("left", "左臂"), ("right", "右臂")):
+            follow_info = status["follow"][side]
+            guard = follow_info.get("joint_guard", {})
+            if status.get("local_limits", {}).get(side):
+                motion_notes.append(f"{name}目标被拒绝，已请求保持；松开中指，控制器正常后重新接管，另一臂及采集继续")
+            elif guard.get("limited"):
+                motion_notes.append(f"{name}边界/奇异位形软约束：{guard.get('nearest_joint')}余量 {guard.get('remaining_deg')}°；可向内收回")
+            elif follow_info.get("lead_limited"):
+                motion_notes.append(f"{name}目标领先量已限制，正在平顺跟随；采集继续")
+        self.motion_warning_text.set("；".join(motion_notes))
+        self.details_text.set("运行版本："+status.get("runtime_revision", "未知")+"\n"+
+                              status["message"]+"\n"+str(status.get("robot_status", {}))+
+                              "\n采集缺帧原因："+str(status["recording_drops"])+
+                              "\n仅 RGB，曝光/增益锁定值（SDK 单位）："+str(status.get("camera_settings", {})))
 
     def update(self, cameras, status):
         if self.exit_requested:

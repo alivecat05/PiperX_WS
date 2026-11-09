@@ -10,7 +10,7 @@ button{font:inherit;padding:14px 22px;cursor:pointer;background:#f8fafc;color:#1
 </style>
 <h1>PiperX 双臂遥操</h1>
 <p>B：开始录制 · A：结束录制<br>
-中指键：按住使能并控制对应机械臂，松开停在当前位置<br>
+中指键：按住使能并控制对应机械臂，松开后保持松开前最后下发的滤波位姿<br>
 食指扳机：按下闭合夹爪，松开张开（独立于中指键）</p>
 <p>松开两个中指键、等待录制保存完成后：Y 长按 1.5 秒复位；X 长按 2 秒保存当前初始位。<br>
 复位过程中：松开 Y，再按一次 Y 取消复位。</p>
@@ -18,6 +18,8 @@ button{font:inherit;padding:14px 22px;cursor:pointer;background:#f8fafc;color:#1
 配置为 v189 时，电脑窗口「恢复遥操」也可主动退出示教并请求保持当前位置，等待控制器反馈确认。确认状态正常后，松开按键，再重新按中指键接管。示教期间除显式退出请求外，程序停止发送运动指令，不会自动 reset 或失能。</p>
 <p>挂脖采集：先用 USB 连接电脑并运行 teleop.cmd awake，无需 MQDH；确认离脸后手柄仍被追踪。<br>
 采集时看真实场景，三路 RGB 和录制状态显示在电脑窗口；头显保持追踪即可。</p>
+<p><strong>启动方向：</strong>先让头显正对机械臂基座 X 轴方向，再点击下面的按钮。当前安装按此方向启动即可正常跟随，无需三点标定。<br>
+重新进入追踪时也保持同样朝向；按中指接管时会自动记录当前手柄位置和末端姿态。</p>
 <button id="enter">启动手柄追踪</button>
 <p id="status">等待连接。启动后头显显示黑屏，这是正常的。</p>
 <canvas id="xr" hidden></canvas>

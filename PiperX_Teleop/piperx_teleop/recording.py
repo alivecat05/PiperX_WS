@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 
 from .core import ACTION_SEMANTICS, CAMERAS, VECTOR_NAMES, History
+from .video_timeline import VideoTimeline, grid_count
 
 
 class Recorder:
@@ -24,7 +25,7 @@ class Recorder:
         self.path = None
         self.error = None
         self.result = None
-        self.count = self.dropped = 0
+        self.count = self.dropped = self.valid_count = self.placeholder_count = 0
         self.drop_reasons = Counter()
         self.first_sample_t = self.last_sample_t = None
         self.last_grid_index = -1
@@ -70,7 +71,7 @@ class Recorder:
         except FileExistsError:
             raise ValueError(f"采集目录已存在，请更换序号：{path}") from None
         self.path = path
-        self.count = self.dropped = 0
+        self.count = self.dropped = self.valid_count = self.placeholder_count = 0
         self.drop_reasons = Counter()
         self.first_sample_t = self.last_sample_t = None
         self.last_grid_index = -1
@@ -88,7 +89,8 @@ class Recorder:
         self.config_snapshot = copy.deepcopy(self.cfg)
         for key in ("task", "task_id", "capture_index"):
             self.config_snapshot.pop(key, None)
-        self.queue = Queue(maxsize=60)
+        group_bytes = sum(c["width"]*c["height"]*3 for c in self.cfg["cameras"].values())
+        self.queue = Queue(maxsize=max(2, min(60, 128*1024*1024//group_bytes)))
         self.finished = Event()
         self.thread = Thread(target=self._write, daemon=True, name="episode-writer")
         self.thread.start()
@@ -100,22 +102,23 @@ class Recorder:
             raise RuntimeError(self.error)
         if type(grid_index) is not int or grid_index <= self.last_grid_index:
             raise ValueError("Recording grid indexes must increase")
+        gap = grid_index-self.last_grid_index-1
+        unreported = max(0, gap-self.missing_run)
+        if unreported:
+            self.dropped += unreported
+            self.drop_reasons["grid_gap"] += unreported
         try:
             self.queue.put_nowait((sample, grid_index))
-            gap = grid_index - self.last_grid_index - 1
-            # Controller reports matching failures itself; also detect gaps from offline callers.
-            unreported = max(0, gap - self.missing_run)
-            if unreported:
-                self.dropped += unreported
-                self.drop_reasons["grid_gap"] += unreported
             self.last_grid_index = grid_index
             self.missing_run = 0
             if self.first_sample_t is None:
                 self.first_sample_t = sample["timestamp_monotonic_s"]
             self.last_sample_t = sample["timestamp_monotonic_s"]
-        except Full as error:
-            self.error = "Episode writer queue full; disk cannot sustain recording"
-            raise RuntimeError(self.error) from error
+        except Full:
+            self.drop("writer_queue_full")
+            self.last_grid_index, self.missing_run = grid_index, 0
+            return False
+        return True
 
     def drop(self, reason):
         self.dropped += 1
@@ -128,9 +131,10 @@ class Recorder:
         row = {key: value for key, value in sample.items()
                if key not in ("images", "timestamp_monotonic_s", "action_timestamp_monotonic_s",
                               "source_timestamps", "camera_metadata")}
+        action_t = sample.get("action_timestamp_monotonic_s", sample["timestamp_monotonic_s"])
         row.update(
             timestamp_unix_s=sample["timestamp_monotonic_s"] + self.unix_offset,
-            action_timestamp_unix_s=sample.get("action_timestamp_monotonic_s", sample["timestamp_monotonic_s"]) + self.unix_offset,
+            action_timestamp_unix_s=action_t+self.unix_offset if action_t is not None else None,
             grid_index=grid_index, frame_index=self.count,
             videos={name: f"{name}.mp4" for name in CAMERAS},
         )
@@ -138,14 +142,14 @@ class Recorder:
         def unix_stamps(value):
             if isinstance(value, dict):
                 return {key: unix_stamps(item) for key, item in value.items()}
-            return value + self.unix_offset
+            return value+self.unix_offset if value is not None else None
 
         row["source_timestamps_unix_s"] = unix_stamps(sample["source_timestamps"])
         row["camera_metadata"] = {}
         for name, meta in sample.get("camera_metadata", {}).items():
             row["camera_metadata"][name] = {
                 k: v for k, v in meta.items() if k not in ("device_ms", "receive_s")}
-            if "receive_s" in meta:
+            if meta.get("receive_s") is not None:
                 row["camera_metadata"][name]["receive_unix_s"] = meta["receive_s"] + self.unix_offset
         return row
 
@@ -178,6 +182,7 @@ class Recorder:
                   (self.path / "action.csv").open("w", encoding="utf-8", newline="") as action_file):
                 actions = csv.writer(action_file)
                 actions.writerow(["timestamp_unix_s", *VECTOR_NAMES])
+                timeline = VideoTimeline(self.config_snapshot, self.start_time, robot=True)
                 # The producer requests completion without waiting for the disk.
                 while not self.finished.is_set() or not self.queue.empty():
                     try:
@@ -185,24 +190,18 @@ class Recorder:
                     except Empty:
                         continue
                     sample, grid_index = item
-                    row = self._disk_row(sample, grid_index)
-                    if np.asarray(row["action"]).shape != (16,) or not np.isfinite(row["action"]).all():
-                        raise ValueError("Action must contain 16 finite TCP/gripper values")
-                    encoded = json.dumps(row, allow_nan=False) + "\n"
-                    for name in CAMERAS:
-                        camera = self.config_snapshot["cameras"][name]
-                        bgr = sample["images"][name]
-                        if bgr.shape != (camera["height"], camera["width"], 3) or bgr.dtype != np.uint8:
-                            raise ValueError(f"Invalid RGB frame: {name}")
-                        videos[name].write(bgr)
-                    stream.write(encoded)
-                    actions.writerow([format(row["timestamp_unix_s"], ".6f"), *row["action"]])
-                    stream.flush()
-                    action_file.flush()
-                    self.count += 1
-                    self.max_synchronization_span_s = max(self.max_synchronization_span_s,
-                                                         sample.get("synchronization_span_s", 0.))
-                    self.writes.add(time.perf_counter(), self.count)
+                    for frame, index in timeline.accept(sample, grid_index):
+                        self._write_frame(frame, index, videos, stream, actions)
+                count = (grid_count(self.start_time, self.end_time, self.cfg["record_hz"])
+                         if self.end_time is not None else self.last_grid_index+1+self.missing_run)
+                for frame, index in timeline.finish(count):
+                    self._write_frame(frame, index, videos, stream, actions)
+                unreported = max(0, self.placeholder_count-self.dropped)
+                self.dropped += unreported
+                if unreported:
+                    self.drop_reasons["tail_gap"] += unreported
+                stream.flush()
+                action_file.flush()
                 os.fsync(stream.fileno())
                 os.fsync(action_file.fileno())
         except Exception as error:
@@ -216,7 +215,7 @@ class Recorder:
         try:
             if not self.error:
                 self._check_videos()
-            result = "complete" if self.complete and not self.error and self.count and not self.dropped else "incomplete"
+            result = "complete" if self.complete and not self.error and self.valid_count and not self.dropped else "incomplete"
             self._manifest(result, self.reason)
             self.result = result
         except Exception as error:
@@ -226,6 +225,28 @@ class Recorder:
                 self._manifest("incomplete", self.reason)
             except OSError:
                 pass
+
+    def _write_frame(self, sample, grid_index, videos, stream, actions):
+        row = self._disk_row(sample, grid_index)
+        if sample["sample_valid"] and (np.asarray(row["action"]).shape != (16,)
+                                       or not np.isfinite(row["action"]).all()):
+            raise ValueError("Action must contain 16 finite TCP/gripper values")
+        encoded = json.dumps(row, allow_nan=False)+"\n"
+        for name in CAMERAS:
+            camera, bgr = self.config_snapshot["cameras"][name], sample["images"][name]
+            if bgr.shape != (camera["height"], camera["width"], 3) or bgr.dtype != np.uint8:
+                raise ValueError(f"Invalid RGB frame: {name}")
+            videos[name].write(bgr)
+        stream.write(encoded)
+        actions.writerow([format(row["timestamp_unix_s"], ".6f"), *row["action"]])
+        self.count += 1
+        if sample["sample_valid"]:
+            self.valid_count += 1
+            self.max_synchronization_span_s = max(self.max_synchronization_span_s,
+                                                 sample.get("synchronization_span_s", 0.))
+        else:
+            self.placeholder_count += 1
+        self.writes.add(time.perf_counter(), self.count)
 
     def stop(self, reason="controller_stop", complete=True, end_time=None):
         """Stop accepting samples; the writer drains and commits in the background."""
@@ -244,9 +265,12 @@ class Recorder:
         manifest = {
             "schema": "piperx.rgb_action.v2", "status": status, "reason": reason,
             "simulated": self.mock, "frames": self.count, "dropped_grid_ticks": self.dropped,
+            "valid_frames": self.valid_count, "placeholder_frames": self.placeholder_count,
+            "video_duration_s": self.count/self.cfg["record_hz"],
+            "capture_duration_s": self.end_time-self.start_time if self.end_time is not None else None,
             "drop_reasons": dict(self.drop_reasons),
-            "effective_fps": ((self.count-1)/(self.last_sample_t-self.first_sample_t)
-                if self.count > 1 and self.last_sample_t > self.first_sample_t else 0.),
+            "effective_fps": ((self.valid_count-1)/(self.last_sample_t-self.first_sample_t)
+                if self.valid_count > 1 and self.last_sample_t > self.first_sample_t else 0.),
             "synchronization_max_span_s": 1 / self.config_snapshot["record_hz"],
             "observed_max_synchronization_span_s": self.max_synchronization_span_s,
             "longest_missing_run_s": self.longest_missing_run / self.config_snapshot["record_hz"],
@@ -257,7 +281,7 @@ class Recorder:
             "videos": {name: f"{name}.mp4" for name in CAMERAS},
             "action_file": "action.csv",
             "frame_alignment": "MP4 frame N = action.csv data row N = samples.jsonl row N (zero-based)",
-            "video_timeline": "constant fps; any missing grid tick marks the episode incomplete; no duplicated frames",
+            "video_timeline": "wall-time CFR grid; gaps hold previous images (black before first frame); sample_valid=false; source timestamps unchanged",
             "vector_names": VECTOR_NAMES,
             "action_semantics": ACTION_SEMANTICS,
             "pose_convention": "each arm base; meters; quaternion xyzw; TCP offset in config; gripper meters",

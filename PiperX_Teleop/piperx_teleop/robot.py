@@ -5,6 +5,7 @@ import time
 import numpy as np
 
 from .core import pose_to_vector, vector_to_pose
+from .motion_guard import MotionGuard
 
 # Clear controller latches only; any joint/communication error bits still block recovery.
 RECOVERABLE_STATUSES = (0, 1, 4)  # NORMAL, EMERGENCY_STOP, TARGET_POS_EXCEEDS_LIMIT
@@ -12,6 +13,9 @@ RECOVERABLE_STATUSES = (0, 1, 4)  # NORMAL, EMERGENCY_STOP, TARGET_POS_EXCEEDS_L
 
 class RecoverableRobotError(RuntimeError):
     """A target rejection or operator teaching mode, without motor error bits."""
+    def __init__(self, message, kind="other"):
+        super().__init__(message)
+        self.kind = kind
 
 
 def status_number(value):
@@ -33,6 +37,10 @@ class PiperX:
             self.robot.connect()
             self.robot.set_tcp_offset(cfg["tcp_offset"])
             self.gripper = self.robot.init_effector(self.robot.OPTIONS.EFFECTOR.AGX_GRIPPER)
+            self.motion_guard = MotionGuard(
+                lambda q: pose_to_vector(self.robot.get_flange2tcp_pose(self.robot.fk(list(q))), 0.),
+                self.robot.get_config()["joint_limits"], cfg)
+            self.guard_status = {"limited": False}
         except Exception:
             self.robot.disconnect()
             raise
@@ -62,10 +70,12 @@ class PiperX:
         teach_status = status_number(getattr(status.msg, "teach_status", 0))
         # teach_status may retain the last teaching command after CAN control resumes.
         teaching = control_mode in (2, 6) or code in (11, 13)
-        teaching |= teach_status == 1 and control_mode != 1
+        # teach_status is a latched command, including in standby after a manual
+        # exit. Current control mode / arm status determine whether teaching is active.
         recoverable = not status.msg.err_code and (code == 4 or (teaching and code in (0, 11, 13)))
         if recoverable and not allow_recovery:
-            raise RecoverableRobotError(f"Robot needs recovery: {status.msg.arm_status}; teaching={teaching}")
+            raise RecoverableRobotError(f"Robot needs recovery: {status.msg.arm_status}; teaching={teaching}",
+                                        kind="teaching" if teaching else "target_limit")
         if status.msg.err_code or (code != 0 and not recoverable):
             logging.getLogger(__name__).info("Robot status: %s", status.msg)
             if code == 1:
@@ -131,6 +141,12 @@ class PiperX:
         self.send_pose(vector)
         self.send_gripper(vector[7])
 
+    def constrain_target(self, vector, state, dt):
+        if not self.cfg.get("joint_guard_enabled", False):
+            return list(vector), {"limited": False}
+        target, self.guard_status = self.motion_guard.apply(vector, state, dt)
+        return target, self.guard_status
+
     def send_pose(self, vector):
         flange = self.robot.get_tcp2flange_pose(vector_to_pose(vector))
         self.robot.move_p(list(flange))
@@ -146,15 +162,17 @@ class PiperX:
         self.robot.move_j(list(joints))
 
     def cartesian_start_issue(self, joints):
-        # Holding measured joints and entering Cartesian IK are different operations.
-        # An exactly-on-limit pose may reject even a tiny Cartesian step. Require room to move.
+        if np.asarray(joints).shape != (6,) or not np.isfinite(joints).all():
+            return "Cartesian control requires six finite measured joint angles"
+        # SDK presets are not active limits unless explicitly enabled. A joint
+        # on a boundary can move back into range; do not reserve a 2-degree band.
+        if not self.robot.get_joint_limits_enabled():
+            return ""
         limits = self.robot.get_config()["joint_limits"]
-        margin = np.deg2rad(2)
         for index, angle in enumerate(joints, 1):
             low, high = limits[f"joint{index}"]
-            if not low + margin < angle < high - margin:
-                return (f"J{index}={np.rad2deg(angle):.1f}deg near/outside limit; "
-                        "set a working pose (>2deg from limits)")
+            if not low <= angle <= high:
+                return f"J{index}={np.rad2deg(angle):.1f}deg outside enabled software limits"
         return ""
 
     def hold(self, joints):
@@ -213,6 +231,9 @@ class MockPiperX:
     def send(self, vector):
         self.vector = list(vector)
 
+    def constrain_target(self, vector, state, dt):
+        return list(vector), {"limited": False}
+
     def send_pose(self, vector):
         self.vector[:7] = list(vector[:7])
 
@@ -242,11 +263,12 @@ class MockPiperX:
         pass
 
 
-def validate_vector(vector, cfg):
+def validate_vector(vector, cfg, *, check_workspace=True):
     array = np.asarray(vector)
     if array.shape != (8,) or not np.isfinite(array).all():
         raise ValueError("Invalid robot target")
-    if (np.any(array[:3] < cfg["workspace_min"]) or np.any(array[:3] > cfg["workspace_max"])
+    if ((check_workspace and (np.any(array[:3] < cfg["workspace_min"])
+                             or np.any(array[:3] > cfg["workspace_max"])))
             or not 0 <= array[7] <= cfg["gripper_max_m"]):
         raise ValueError("Target outside configured workspace/gripper limits")
 

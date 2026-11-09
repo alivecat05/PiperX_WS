@@ -28,8 +28,8 @@ class History:
             return list(self.items)
 
     def latest(self):
-        items = self.snapshot()
-        return items[-1] if items else None
+        with self.lock:
+            return self.items[-1] if self.items else None
 
     def fps(self, now, window=2.):
         items = [x for x in self.snapshot() if now-window <= x.t <= now]
@@ -51,7 +51,7 @@ class Synchronizer:
         for name in CAMERAS:
             near = [x for x in self.histories[name].snapshot()
                     if abs(x.t-t) <= tolerance+1e-9
-                    and x.value["frame_number"] > self.last_frames.get(name, -1)]
+                    and x.value.get("sequence", x.value["frame_number"]) > self.last_frames.get(name, -1)]
             if self.cfg["require_sdk_timestamps"]:
                 valid = [x for x in near if x.value["timestamp_basis"] != "host_receive"]
                 if near and not valid:
@@ -74,7 +74,7 @@ class Synchronizer:
             if max(stamps)-min(stamps) > limit+1e-9:
                 continue
             frames = dict(zip(CAMERAS, group))
-            self.last_frames = {n: x.value["frame_number"] for n, x in frames.items()}
+            self.last_frames = {n: x.value.get("sequence", x.value["frame_number"]) for n, x in frames.items()}
             return {"timestamp_monotonic_s": t, "synchronization_span_s": max(stamps)-min(stamps),
                     "source_timestamps": {n: x.t for n, x in frames.items()},
                     "camera_metadata": {n: {k: v for k, v in x.value.items() if k != "bgr"}

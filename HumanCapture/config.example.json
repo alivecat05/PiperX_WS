@@ -5,7 +5,7 @@
     "debounce_ms": 250
   },
   "sync": {
-    "delay_ms": 80,
+    "delay_ms": 120,
     "camera_tolerance_ms": 33.333333333333336,
     "camera_span_ms": 33.333333333333336,
     "require_sdk_timestamps": true

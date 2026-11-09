@@ -2,6 +2,7 @@ import csv
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from threading import Event
 
 import cv2
 import numpy as np
@@ -85,10 +86,10 @@ def test_video_csv_alignment_and_auto_increment(cfg):
     control.request("record_stop")
     control.tick(100.5)
     assert control.recording  # Preserve stop boundary while buffering the tail.
-    control.tick(100.6)
+    control.tick(100.5+cfg["sync"]["delay_ms"]/1000+.01)
     assert not control.recording
     assert control.recorder.wait(5)
-    control.tick(100.61)
+    control.tick(100.5+cfg["sync"]["delay_ms"]/1000+.02)
     path = Path(cfg["output"])/"人类拿杯子"/"episode_042"
     manifest = json.loads((path/"manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "complete" and manifest["frames"] == 15
@@ -132,21 +133,76 @@ def test_slow_cameras_cannot_be_disguised_as_complete_30hz(cfg, fps):
     rec.stop(end_time=101)
     assert rec.wait(5)
     assert rec.result == "incomplete" and rec.dropped >= 3
-    assert rec.count < 30
+    assert rec.valid_count < 30 and rec.count == 30
 
 
-def test_camera_loss_finishes_incomplete(cfg):
+def test_camera_loss_and_staleness_do_not_stop_recording_and_new_frames_resume(cfg):
     cams = cameras()
     add_group(cams, cfg, 100, 0)
     control = Controller(cfg, cams, mock=True)
     control.request("record_start", selection={"task": "task", "index": 1, "auto_increment": True})
     control.tick(100)
     cams.errors["left_wrist"] = "RGB stream lost"
-    control.tick(100.05)
+    control.tick(100.8)
+    assert control.recording and control.recorder.active and control.recorder.dropped
+    cams.errors.clear()
+    for i in range(10):
+        add_group(cams, cfg, 100.9+i/30, i+1)
+    control.tick(101.2)
+    assert control.recording
+    control.request("record_stop")
+    control.tick(101.2)
+    control.tick(101.4)
     assert not control.recording
     assert control.recorder.wait(5)
     assert control.recorder.result == "incomplete"
-    assert "left_wrist" in control.recorder.reason
+    assert control.recorder.reason == "operator_stop"
+    rows = [json.loads(row) for row in (control.recorder.path/"samples.jsonl").read_text().splitlines()]
+    assert any(row["sample_valid"] and row["grid_index"] >= 27 for row in rows)
+
+
+def test_reconnecting_camera_frame_number_reset_does_not_block_matching(cfg):
+    cams = cameras()
+    add_group(cams, cfg, 100, 1000)
+    for history in cams.histories.values():
+        history.latest().value["sequence"] = 10
+    sync = Synchronizer(cams.histories, cfg["sync"])
+    assert sync.sample(100)
+    add_group(cams, cfg, 100+1/30, 1)
+    for history in cams.histories.values():
+        history.latest().value["sequence"] = 11
+    assert sync.sample(100+1/30)
+
+
+def test_saturated_writer_drops_one_group_without_stopping_and_can_resume(cfg, monkeypatch):
+    rec = Recorder(cfg["output"], cfg, mock=True)
+    entered, release = Event(), Event()
+    write = rec._write
+    def blocked_writer():
+        entered.set()
+        assert release.wait(5)
+        write()
+    monkeypatch.setattr(rec, "_write", blocked_writer)
+    cams = cameras()
+    add_group(cams, cfg, 100, 0)
+    sample = Synchronizer(cams.histories, cfg["sync"]).sample(100)
+    try:
+        rec.start(100)
+        assert entered.wait(1)
+        for i in range(rec.queue.maxsize):
+            assert rec.add(dict(sample, timestamp_monotonic_s=100+i/30), i)
+        assert rec.add(sample, i+1) is False
+        assert rec.active and rec.error is None and rec.dropped == 1
+        # Allow a subsequent group in this episode after backpressure clears.
+        rec.queue.get_nowait()
+        rec.drop("test_removed_group")
+        assert rec.add(dict(sample, timestamp_monotonic_s=100+(i+2)/30), i+2)
+        rec.stop(end_time=103)
+    finally:
+        release.set()
+        assert rec.wait(5)
+    assert rec.result == "incomplete"
+    assert rec.drop_reasons["writer_queue_full"] == 1
 
 
 def test_no_auto_increment_requires_new_index(cfg):

@@ -104,18 +104,18 @@ def test_target_limit_keeps_both_arms_energized_and_continues_feedback(cfg):
     assert "NOT confirmed" in control.status()["recovery_hold"]["right"]
 
 
-def test_tracking_error_enters_hold_instead_of_damped_emergency_stop(cfg):
+def test_tracking_error_limits_target_without_global_recovery(cfg):
     control = controller(cfg)
     data = neutral()
     data["left"]["grip"] = True
     step(control, data)
     control.robots["left"].vector[0] += .2
     step(control, data)
-    assert control.mode == "recovery" and "cannot follow" in control.message
+    assert control.mode == "teleop" and control.target_lead_limited["left"]
     assert all(not any(c[0] == "stop" for c in robot.calls) for robot in control.robots.values())
 
 
-def test_joint_margin_guard_holds_before_sending_another_cartesian_target(cfg):
+def test_joint_proximity_does_not_interrupt_motion_after_valid_clutch(cfg):
     control = controller(cfg)
     data = neutral()
     data["left"]["grip"] = True
@@ -123,8 +123,9 @@ def test_joint_margin_guard_holds_before_sending_another_cartesian_target(cfg):
     control.robots["left"].issue = "J3 near upper limit"
     data["left"]["position"][2] -= .03
     step(control, data)
-    assert control.mode == "recovery" and "joint limit guard" in control.message
-    assert not any(c[0] in ("send", "stop") for c in control.robots["left"].calls)
+    assert control.mode == "teleop"
+    assert any(c[0] == "send" for c in control.robots["left"].calls)
+    assert not any(c[0] == "stop" for c in control.robots["left"].calls)
 
 
 def test_teaching_suspends_all_commands_and_held_buttons_do_not_resume(cfg):

@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 
 from .core import CAMERAS, History
+from .video_timeline import VideoTimeline, grid_count
 
 
 class Recorder:
@@ -22,9 +23,10 @@ class Recorder:
         self.thread = None
         self.finished = Event()
         self.path = self.result = self.error = None
-        self.count = self.dropped = 0
+        self.count = self.dropped = self.valid_count = self.placeholder_count = 0
         self.drop_reasons = Counter()
         self.writes = History()
+        self.camera_diagnostics = {}
 
     @property
     def busy(self):
@@ -64,13 +66,15 @@ class Recorder:
         self.path, self.task, self.capture_index = path, task, capture_index
         self.config_snapshot = copy.deepcopy(self.cfg)
         self.config_snapshot["task"] = task
-        self.count = self.dropped = 0
+        self.count = self.dropped = self.valid_count = self.placeholder_count = 0
         self.drop_reasons = Counter()
         self.writes = History()
         self.first_t = self.last_t = None
         self.last_grid = -1
         self.reported_missing = 0
         self.max_span = 0.
+        self.queue_high_watermark = 0
+        self.encode_total_s = self.max_encode_s = 0.
         self.error = self.result = None
         self.start_time = start_time
         before = time.perf_counter()
@@ -78,7 +82,10 @@ class Recorder:
         self.unix_offset = wall-(before+time.perf_counter())/2
         self.end_time = None
         self.complete, self.reason = True, "operator_stop"
-        self.queue = Queue(maxsize=60)
+        # Bound retained full-resolution RGB images by bytes, rather than 60 groups
+        # (~516 MB with the deployed profiles), in addition to camera histories.
+        group_bytes = sum(c["width"]*c["height"]*3 for c in self.cfg["cameras"].values())
+        self.queue = Queue(maxsize=max(2, min(60, 128*1024*1024//group_bytes)))
         self.finished = Event()
         # A reserved folder remains identifiable even after an abrupt process termination.
         self._manifest("recording")
@@ -104,10 +111,12 @@ class Recorder:
         try:
             self.queue.put_nowait((sample, grid_index))
         except Full:
-            self.error = "磁盘写入跟不上采集：视频队列已满，本段数据不完整"
-            self.stop(reason="writer_queue_full", complete=False)
-            raise RuntimeError(self.error) from None
+            self.drop("writer_queue_full")
+            self.last_grid, self.reported_missing = grid_index, 0
+            return False
         self.last_grid, self.reported_missing = grid_index, 0
+        self.queue_high_watermark = max(self.queue_high_watermark, self.queue.qsize())
+        return True
 
     def stop(self, reason="operator_stop", complete=True, end_time=None):
         self.reason, self.complete, self.end_time = reason, complete, end_time
@@ -133,39 +142,23 @@ class Recorder:
                 csv_writer = csv.writer(stamps)
                 csv_writer.writerow(["frame_index", "grid_index", "timestamp_unix_s",
                     *[f"{n}_timestamp_unix_s" for n in CAMERAS],
-                    *[f"{n}_frame_number" for n in CAMERAS], "synchronization_span_s"])
+                    *[f"{n}_frame_number" for n in CAMERAS], "synchronization_span_s", "sample_valid", "frame_status"])
+                timeline = VideoTimeline(self.config_snapshot, self.start_time)
                 while not self.finished.is_set() or not self.queue.empty():
                     try:
                         sample, grid = self.queue.get(timeout=.02)
                     except Empty:
                         continue
-                    source = {n: sample["source_timestamps"][n]+self.unix_offset for n in CAMERAS}
-                    metadata = {}
-                    for n in CAMERAS:
-                        metadata[n] = {k: v for k, v in sample["camera_metadata"][n].items()
-                                       if k not in ("receive_s", "device_ms")}
-                        metadata[n]["receive_unix_s"] = sample["camera_metadata"][n]["receive_s"]+self.unix_offset
-                    t = sample["timestamp_monotonic_s"]
-                    row = {"frame_index": self.count, "grid_index": grid,
-                           "timestamp_unix_s": t+self.unix_offset,
-                           "source_timestamps_unix_s": source, "camera_metadata": metadata,
-                           "synchronization_span_s": sample["synchronization_span_s"]}
-                    encoded = json.dumps(row, ensure_ascii=False, allow_nan=False)+"\n"
-                    for n in CAMERAS:
-                        c = self.config_snapshot["cameras"][n]
-                        image = sample["images"][n]
-                        if image.shape != (c["height"], c["width"], 3) or image.dtype != np.uint8:
-                            raise ValueError(f"图像尺寸或格式无效：{n}")
-                        videos[n].write(image)
-                    samples.write(encoded)
-                    csv_writer.writerow([self.count, grid, f"{t+self.unix_offset:.9f}",
-                        *[f"{source[n]:.9f}" for n in CAMERAS],
-                        *[metadata[n]["frame_number"] for n in CAMERAS], f"{sample['synchronization_span_s']:.9f}"])
-                    self.count += 1
-                    self.first_t = t if self.first_t is None else self.first_t
-                    self.last_t = t
-                    self.max_span = max(self.max_span, sample["synchronization_span_s"])
-                    self.writes.add(time.perf_counter(), self.count)
+                    for frame, index in timeline.accept(sample, grid):
+                        self._write_frame(frame, index, videos, samples, csv_writer)
+                count = (grid_count(self.start_time, self.end_time, self.cfg["record_hz"])
+                         if self.end_time is not None else self.last_grid+1+self.reported_missing)
+                for frame, index in timeline.finish(count):
+                    self._write_frame(frame, index, videos, samples, csv_writer)
+                unreported = max(0, self.placeholder_count-self.dropped)
+                self.dropped += unreported
+                if unreported:
+                    self.drop_reasons["tail_gap"] += unreported
                 samples.flush()
                 stamps.flush()
                 os.fsync(samples.fileno())
@@ -188,7 +181,7 @@ class Recorder:
                     finally:
                         video.release()
             # A missing tail grid is also data loss, even if no later frame was accepted.
-            valid = self.complete and not self.error and self.count > 0 and not self.dropped
+            valid = self.complete and not self.error and self.valid_count > 0 and not self.dropped
             self._manifest("complete" if valid else "incomplete")
             self.result = "complete" if valid else "incomplete"
         except Exception as error:
@@ -199,20 +192,66 @@ class Recorder:
             except OSError:
                 pass
 
+    def _write_frame(self, sample, grid, videos, samples, csv_writer):
+        unix = lambda stamp: stamp+self.unix_offset if stamp is not None else None
+        number = lambda value: f"{value:.9f}" if value is not None else ""
+        source = {n: unix(sample["source_timestamps"][n]) for n in CAMERAS}
+        metadata = {}
+        for n in CAMERAS:
+            metadata[n] = {k: v for k, v in sample["camera_metadata"][n].items()
+                           if k not in ("receive_s", "device_ms")}
+            metadata[n]["receive_unix_s"] = unix(sample["camera_metadata"][n].get("receive_s"))
+        t = sample["timestamp_monotonic_s"]
+        row = {"frame_index": self.count, "grid_index": grid, "timestamp_unix_s": unix(t),
+               "source_timestamps_unix_s": source, "camera_metadata": metadata,
+               "synchronization_span_s": sample["synchronization_span_s"],
+               **{k: sample[k] for k in ("sample_valid", "frame_status", "held_from_grid")}}
+        encoded = json.dumps(row, ensure_ascii=False, allow_nan=False)+"\n"
+        encode_start = time.perf_counter()
+        for n in CAMERAS:
+            c, image = self.config_snapshot["cameras"][n], sample["images"][n]
+            if image.shape != (c["height"], c["width"], 3) or image.dtype != np.uint8:
+                raise ValueError(f"图像尺寸或格式无效：{n}")
+            videos[n].write(image)
+        elapsed = time.perf_counter()-encode_start
+        self.encode_total_s += elapsed
+        self.max_encode_s = max(self.max_encode_s, elapsed)
+        samples.write(encoded)
+        csv_writer.writerow([self.count, grid, number(unix(t)), *[number(source[n]) for n in CAMERAS],
+            *[metadata[n]["frame_number"] for n in CAMERAS], number(sample["synchronization_span_s"]),
+            sample["sample_valid"], sample["frame_status"]])
+        self.count += 1
+        if sample["sample_valid"]:
+            self.valid_count += 1
+            self.first_t = t if self.first_t is None else self.first_t
+            self.last_t = t
+            self.max_span = max(self.max_span, sample["synchronization_span_s"])
+        else:
+            self.placeholder_count += 1
+        self.writes.add(time.perf_counter(), self.count)
+
     def _manifest(self, status):
         manifest = {"schema": "human_capture.rgb.v1", "status": status,
             "task": self.task, "capture_index": self.capture_index, "reason": self.reason,
             "simulated": self.mock, "fps": self.cfg["record_hz"], "frames": self.count,
+            "valid_frames": self.valid_count, "placeholder_frames": self.placeholder_count,
+            "video_duration_s": self.count/self.cfg["record_hz"],
+            "capture_duration_s": self.end_time-self.start_time if self.end_time is not None else None,
             "dropped_grid_ticks": self.dropped, "drop_reasons": dict(self.drop_reasons),
-            "effective_fps": ((self.count-1)/(self.last_t-self.first_t)
-                              if self.count > 1 and self.last_t > self.first_t else 0.),
+            "camera_diagnostics": self.camera_diagnostics,
+            "writer_diagnostics": {"queue_capacity": self.queue.maxsize,
+                "queue_high_watermark": self.queue_high_watermark,
+                "mean_encode_ms": self.encode_total_s/max(1, self.count)*1000,
+                "max_encode_ms": self.max_encode_s*1000},
+            "effective_fps": ((self.valid_count-1)/(self.last_t-self.first_t)
+                              if self.valid_count > 1 and self.last_t > self.first_t else 0.),
             "synchronization_max_span_s": 1/self.cfg["record_hz"],
             "observed_max_synchronization_span_s": self.max_span,
             "start_unix_s": self.start_time+self.unix_offset,
             "end_unix_s": self.end_time+self.unix_offset if self.end_time is not None else None,
             "videos": {n: f"{n}.mp4" for n in CAMERAS}, "timestamp_file": "timestamps.csv",
             "frame_alignment": "MP4 frame N = timestamps.csv data row N = samples.jsonl row N (zero-based)",
-            "video_timeline": "30 Hz grid; missing frames mark incomplete; no duplicated frames",
+            "video_timeline": "wall-time CFR grid; gaps hold previous images (black before first frame); sample_valid=false; source timestamps unchanged",
             "synchronization": "SDK global/system time mapped to a common monotonic clock; software alignment",
             "config": self.config_snapshot, "error": self.error}
         temp = self.path/"manifest.tmp"

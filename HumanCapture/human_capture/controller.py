@@ -91,9 +91,9 @@ class Controller:
     def tick(self, now):
         self._commands(now)
         if self.recording:
-            problems = self.health(now)
-            if problems or self.recorder.error or not self.recorder.active:
-                self.message = "录制已停止："+("；".join(problems) or self.recorder.error or "写入线程停止")
+            # A late/missing camera is a gap in the dataset, not a stop command.
+            if self.recorder.error or not self.recorder.active:
+                self.message = "录制已停止："+(self.recorder.error or "写入线程停止")
                 self.recorder.stop(self.message, complete=False, end_time=now)
                 self.recording = False
             else:
@@ -121,7 +121,8 @@ class Controller:
             self.last_result = self.recorder.result
             self.message = (f"已保存 {self.recorder.count} 帧：{self.recorder.path}"
                             if self.last_result == "complete" else
-                            f"本段不完整（丢帧 {self.recorder.dropped}）：{self.recorder.error or self.recorder.reason}；{self.recorder.path}")
+                            f"已保存 {self.recorder.count} 帧（含缺帧，详情见 manifest.json）："
+                            f"{self.recorder.error or self.recorder.reason}；{self.recorder.path}")
 
     def _publish(self, now):
         problems = self.health(now)
@@ -131,13 +132,24 @@ class Controller:
                  "ready": not problems and not self.capture.error,
                  "problems": problems, "message": self.message, "frames": self.recorder.count,
                  "dropped": self.recorder.dropped, "drop_reasons": dict(self.recorder.drop_reasons),
+                 "valid_frames": self.recorder.valid_count, "placeholder_frames": self.recorder.placeholder_count,
+                 "duration_s": max(0, ((self.end_time if self.end_time is not None else now)
+                     if self.recording else (self.recorder.end_time or self.recorder.start_time))
+                     -self.recorder.start_time) if hasattr(self.recorder, "start_time") else 0.,
                  "write_fps": self.recorder.writes.fps(now), "result": self.recorder.result,
+                 "writer_queue": self.recorder.queue.qsize() if hasattr(self.recorder, "queue") else 0,
+                 "writer_queue_capacity": self.recorder.queue.maxsize if hasattr(self.recorder, "queue") else 0,
                  "path": str(self.recorder.path or ""), "cameras": {}}
         for n in CAMERAS:
             frame = self.cameras.histories[n].latest()
             state["cameras"][n] = {"fps": self.cameras.histories[n].fps(now),
                 "frame_number": frame.value["frame_number"] if frame else None,
-                "clock": frame.value["timestamp_basis"] if frame else "等待相机"}
+                "clock": frame.value["timestamp_basis"] if frame else "等待相机",
+                "receive_age_ms": round(max(0, now-frame.value["receive_s"])*1000, 1) if frame else None,
+                "arrival_delay_ms": round((frame.value["receive_s"]-frame.t)*1000, 1) if frame else None,
+                "exposure_settings": getattr(self.cameras, "exposure_settings", {}).get(n),
+                **dict(getattr(self.cameras, "diagnostics", {}).get(n, {}))}
+        self.recorder.camera_diagnostics = copy.deepcopy(state["cameras"])
         with self.lock:
             self.snapshot = state
 
@@ -158,7 +170,7 @@ class Controller:
             self.stop_event.wait(.005)
 
     def close(self):
-        # Let the normal stop path align the final 80 ms before stopping the producer.
+        # Let the normal stop path align the configured buffer tail before stopping the producer.
         self.request("record_stop")
         deadline = time.perf_counter()+2
         while self.thread and self.thread.is_alive() and self.recording and time.perf_counter() < deadline:

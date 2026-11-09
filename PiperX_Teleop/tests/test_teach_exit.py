@@ -6,6 +6,7 @@ import pytest
 
 from piperx_teleop.robot import PiperX
 from piperx_teleop.operator_guidance import recovery_guidance
+from piperx_teleop.preview import banner_style
 from test_motion_recovery import cfg, controller, enter_limit_recovery, neutral, sdk_adapter
 from test_pipeline import step
 
@@ -36,13 +37,73 @@ def test_unsupported_or_invalid_exit_sends_nothing(firmware, joints):
     with pytest.raises(ValueError): adapter.exit_teaching(joints)
 
 
-def test_old_teach_status_does_not_override_fresh_can_normal_mode():
+@pytest.mark.parametrize("mode", [0, 1])
+def test_old_teach_status_does_not_override_fresh_normal_mode(mode):
     adapter = sdk_adapter(0)
     status = adapter.robot.get_arm_status().msg
     status.teach_status = 1
-    status.ctrl_mode = 1
+    status.ctrl_mode = mode
     _, state = adapter.read()
     assert state["teaching"] is False and state["teach_status"] == 1
+
+
+def test_manual_teach_exit_with_power_restored_returns_to_ready_at_new_pose(cfg):
+    control = teaching_controller(cfg)
+    for robot in control.robots.values():
+        robot.joints = [.15]*6
+        robot.teaching, robot.code = False, 0
+        robot.calls.clear()
+    step(control, neutral())
+    assert control.recovery_after_teach_exit
+    assert all(target == [.15]*6 for target in control.recovery_hold_targets.values())
+    control.recovery_neutral_since = time.perf_counter()-.31
+    step(control, neutral())
+    step(control, neutral())
+    assert control.mode == "paused"
+    step(control, neutral())
+    control.resume_since = time.perf_counter()-.31
+    step(control, neutral())
+    assert control.mode == "idle" and control.ready
+    assert banner_style(control.status())[0] == "#168a46"
+    for robot in control.robots.values():
+        assert all(c[1] == [.15]*6 for c in robot.calls if c[0] == "hold")
+        assert not any(c[0] in ("stop", "send", "exit_teach") for c in robot.calls)
+
+
+def test_manual_exit_can_start_a_new_episode_after_teaching_interrupted_capture(cfg):
+    control = controller(cfg)
+    control.begin_input()
+    data = neutral()
+    data["buttons"]["record_start"] = True
+    step(control, data)
+    previous_path = control.recorder.path
+    assert control.recorder.active
+    control.robots["left"].code, control.robots["left"].teaching = 11, True
+    step(control, neutral())
+    assert control.mode == "recovery" and control.recorder.wait(3)
+    control.robots["left"].code, control.robots["left"].teaching = 0, False
+    control.robots["left"].joints = [.2]*6
+    step(control, neutral())
+    held = neutral()
+    held["left"]["grip"] = True
+    step(control, held)
+    assert control.mode == "recovery" and not control.recovery_enabling
+    step(control, neutral())
+    control.recovery_neutral_since = time.perf_counter()-.31
+    step(control, neutral())
+    step(control, neutral())
+    assert control.mode == "paused"
+    step(control, neutral())
+    control.resume_since = time.perf_counter()-.31
+    step(control, neutral())
+    assert banner_style(control.status())[0] == "#168a46"
+    step(control, data)
+    try:
+        assert control.recorder.active and control.recorder.path != previous_path
+        assert banner_style(control.status())[0] == "#cf233a"
+    finally:
+        control.recorder.stop()
+        assert control.recorder.wait(3)
 
 
 def teaching_controller(cfg, acknowledge=True):

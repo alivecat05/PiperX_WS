@@ -15,6 +15,25 @@ def neutral_packet():
     return data
 
 
+def test_taught_tcp_outside_workspace_does_not_fault_idle_or_stop_capture(cfg, monkeypatch):
+    control = make_controller(cfg)
+    robot = control.robots["left"]
+    robot.vector[0] = cfg["arms"]["left"]["workspace_max"][0]+.05
+    monkeypatch.setattr(robot, "send", lambda _: pytest.fail("Outside workspace pose was commanded"))
+    step(control, neutral_packet())
+    data = neutral_packet()
+    data["buttons"]["record_start"] = True
+    step(control, data)
+    assert control.recorder.active
+    data["buttons"]["record_start"] = False
+    data["left"]["grip"] = True
+    step(control, data)
+    assert control.cartesian_blocked["left"] and control.mode != "recovery"
+    assert control.recorder.active
+    control.recorder.stop()
+    assert control.recorder.wait(3)
+
+
 def resume(control):
     step(control, neutral_packet())
     control.resume_since = time.perf_counter()-.31
@@ -151,7 +170,7 @@ def test_active_hand_pause_can_resume_with_unused_other_hand_missing(cfg):
     assert control.mode == "idle"
 
 
-def test_camera_failure_during_input_pause_requires_recovery_without_dropping_power(cfg, monkeypatch):
+def test_camera_failure_does_not_turn_tracking_pause_into_global_recovery(cfg, monkeypatch):
     control = make_controller(cfg)
     step(control, neutral_packet())
     control.disconnect()
@@ -161,10 +180,13 @@ def test_camera_failure_during_input_pause_requires_recovery_without_dropping_po
         monkeypatch.setattr(robot, "stop", lambda side=side: stopped.append(side))
     control.cameras.errors["head"] = "camera unplugged"
     step(control, neutral_packet())
-    assert control.mode == "recovery" and stopped == []
+    assert control.mode == "paused" and stopped == []
     control.cameras.errors.clear()
     step(control, neutral_packet())
-    assert control.mode == "recovery"  # Camera return must not resume old input automatically.
+    assert control.mode == "paused"  # Neutral release, rather than camera recovery, resumes input.
+    control.resume_since = time.perf_counter()-.31
+    step(control, neutral_packet())
+    assert control.mode == "idle"
 
 
 @pytest.mark.parametrize("failure", ["hold", "read"])

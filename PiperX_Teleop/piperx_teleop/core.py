@@ -36,8 +36,8 @@ class History:
             return list(self.items)
 
     def latest(self):
-        items = self.snapshot()
-        return items[-1] if items else None
+        with self.lock:
+            return self.items[-1] if self.items else None
 
     def select(self, t, tolerance, causal=False):
         items = self.snapshot()
@@ -70,47 +70,85 @@ class PoseMapper:
                 and np.isclose(np.linalg.det(self.basis), 1)):
             raise ValueError("xr_to_base must be a right-handed 3x3 rotation")
         self.anchor = None
+        self.orientation_offset = None
+        self.calibration_id = 0
         self.target = None
+        self.requested_target = None
         self.rate_limited = False
 
     def release(self, state):
         self.anchor = None
+        self.orientation_offset = None
         self.target = list(state)
+        self.requested_target = list(state)
         self.rate_limited = False
+
+    def calibrate(self, hand, state):
+        """Define the current controller/TCP pair as aligned without moving it."""
+        hand_r = Rotation.from_quat(hand["quaternion"])
+        basis_r = Rotation.from_matrix(self.basis)
+        mapped_hand = basis_r*hand_r*basis_r.inv()
+        self.orientation_offset = mapped_hand.inv()*Rotation.from_quat(state[3:7])
+        self.anchor = (np.array(hand["position"], dtype=float), hand_r, list(state))
+        self.target = list(state)
+        self.requested_target = list(state)
+        self.rate_limited = False
+        self.calibration_id += 1
+
+    def calibration_status(self):
+        return {"calibrated": self.anchor is not None, "id": self.calibration_id,
+                "xr_to_base": self.basis.tolist(),
+                "zone_center_xr": self.anchor[0].tolist() if self.anchor else None,
+                "hand_reference_quaternion": self.anchor[1].as_quat().tolist() if self.anchor else None,
+                "tcp_reference_quaternion": list(self.anchor[2][3:7]) if self.anchor else None,
+                "orientation_offset_quaternion": (self.orientation_offset.as_quat().tolist()
+                                                   if self.orientation_offset is not None else None)}
+
+    def _smoothing_alpha(self, error, scale, dt):
+        fixed_tau = self.cfg.get("pose_smoothing_s", 0.)
+        tremor_tau = self.cfg.get("tremor_smoothing_s", .04)
+        # Strong damping close to the held target, with a shorter response time
+        # for deliberate displacement. This changes response, never pose scale.
+        adaptive_tau = (max(min(.01, tremor_tau), tremor_tau/(1+(error/scale)**2))
+                        if tremor_tau > 0 else 0.)
+        tau = max(fixed_tau, adaptive_tau)
+        return -np.expm1(-dt/tau) if tau > 0 else 1.
 
     def update(self, hand, state, dt):
         width = (1 - hand["trigger"]) * self.cfg["gripper_max_m"]
         if not hand["grip"]:
             if self.anchor is not None or self.target is None:
-                self.release(state)
+                self.release(self.target if self.target is not None else state)
             self.target[7] = width
+            self.requested_target = list(self.target)
             return list(self.target)
         if self.anchor is None:
-            self.anchor = (np.array(hand["position"]), Rotation.from_quat(hand["quaternion"]), list(state))
-            self.target = list(state)
+            self.calibrate(hand, state)
             self.target[7] = width
             return list(self.target)  # Clutch press itself never moves the robot.
         origin_p, origin_r, origin_tcp = self.anchor
         position = np.array(origin_tcp[:3]) + self.cfg["position_scale"] * self.basis @ (
             np.array(hand["position"]) - origin_p)
+        requested_position = position.copy()
         position = np.clip(position, self.cfg["workspace_min"], self.cfg["workspace_max"])
         delta = position - self.target[:3]
         # Filter throughout the clutch, not only before the first deliberate motion.
-        tau = self.cfg.get("pose_smoothing_s", 0.)
-        alpha = -np.expm1(-dt / tau) if tau > 0 else 1.
         distance = np.linalg.norm(delta)
         deadband = self.cfg.get("position_deadband_m", .001)
+        alpha = self._smoothing_alpha(distance, max(3*deadband, .003), dt)
         delta *= alpha * max(0., 1-deadband/max(distance, 1e-12))
         limit = self.cfg["max_speed_m_s"] * dt
         self.rate_limited = np.linalg.norm(delta) > limit + 1e-9
         position = np.array(self.target[:3]) + delta * min(1., limit / max(np.linalg.norm(delta), 1e-9))
         basis_r = Rotation.from_matrix(self.basis)
-        desired_r = (basis_r * Rotation.from_quat(hand["quaternion"]) * origin_r.inv()
-                     * basis_r.inv() * Rotation.from_quat(origin_tcp[3:7]))
+        desired_r = (basis_r*Rotation.from_quat(hand["quaternion"])*basis_r.inv()
+                     * self.orientation_offset)
+        self.requested_target = [*requested_position, *desired_r.as_quat(), width]
         current_r = Rotation.from_quat(self.target[3:7])
         rotvec = (desired_r * current_r.inv()).as_rotvec()
         angle = np.linalg.norm(rotvec)
         deadband = self.cfg.get("rotation_deadband_rad", np.deg2rad(.5))
+        alpha = self._smoothing_alpha(angle, max(2*deadband, np.deg2rad(1)), dt)
         rotvec *= alpha * max(0., 1-deadband/max(angle, 1e-12))
         self.rate_limited |= np.linalg.norm(rotvec) > self.cfg["max_rotation_rad_s"] * dt + 1e-9
         rotvec *= min(1., self.cfg["max_rotation_rad_s"] * dt / max(np.linalg.norm(rotvec), 1e-9))
@@ -140,7 +178,7 @@ class Synchronizer:
         candidates = {}
         for name, hist in self.cameras.items():
             near = [x for x in hist.snapshot() if abs(x.t-t) <= tolerance + 1e-9
-                    and x.value["frame_number"] > self.last_frames.get(name, -1)]
+                    and x.value.get("sequence", x.value["frame_number"]) > self.last_frames.get(name, -1)]
             if cfg.get("require_sdk_timestamps", True):
                 if near and any(x.value.get("timestamp_basis") == "host_receive" for x in near):
                     near = [x for x in near if x.value.get("timestamp_basis") != "host_receive"]
@@ -184,7 +222,7 @@ class Synchronizer:
             break
         if frames is None:
             return self._reject("timestamp_span_exceeds_one_frame")
-        ids = {name: x.value["frame_number"] for name, x in frames.items()}
+        ids = {name: x.value.get("sequence", x.value["frame_number"]) for name, x in frames.items()}
         self.last_frames = ids
         return {
             "timestamp_monotonic_s": t,

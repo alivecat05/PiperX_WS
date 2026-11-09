@@ -124,7 +124,9 @@ def test_missing_grid_never_marks_lower_rate_video_complete(cfg):
     writer.stop(end_time=10.2)
     assert writer.wait(5) and writer.result == "incomplete"
     meta = json.loads((writer.path/"manifest.json").read_text())
-    assert meta["dropped_grid_ticks"] == 1 and meta["effective_fps"] < 30
+    assert meta["dropped_grid_ticks"] == 2 and meta["effective_fps"] < 30
+    assert meta["frames"] == 6 and meta["valid_frames"] == 4
+    assert meta["video_duration_s"] == pytest.approx(.2)
 
 
 def test_encoder_failure_cannot_commit_complete_episode(cfg, monkeypatch):
@@ -223,7 +225,7 @@ def test_pose_noise_is_filtered_after_motion_has_started(cfg):
 @pytest.mark.parametrize("scale", [.5, 1., 2.])
 def test_position_scale_multiplies_hand_displacement(cfg, scale):
     arm = dict(cfg["arms"]["left"], position_scale=scale, pose_smoothing_s=0,
-               position_deadband_m=0, max_speed_m_s=10)
+               tremor_smoothing_s=0, position_deadband_m=0, max_speed_m_s=10)
     mapper = PoseMapper(arm)
     state = [.3, 0, .3, 0, 0, 0, 1, .04]
     hand = packet()["left"]
@@ -246,13 +248,14 @@ def test_default_follow_does_not_accumulate_catchup_at_normal_hand_speed(cfg):
         hand["position"][2] = -.2*i/60  # 20 cm/s hand motion for one second.
         target = mapper.update(hand, state, 1/60)
         desired = .3+arm["position_scale"]*.2*i/60
-        assert abs(target[0]-desired) <= arm["position_deadband_m"]+1e-9
+        assert abs(target[0]-desired) <= .003  # Small bounded filter lag, not growing catch-up.
         assert not mapper.rate_limited
         state = target
     stopped = list(target)
-    for _ in range(10):
+    for _ in range(60):
         target = mapper.update(hand, state, 1/60)
-        assert target[:3] == pytest.approx(stopped[:3], abs=1e-9)
+        assert np.linalg.norm(np.asarray(target[:3])-stopped[:3]) <= .002
+    assert abs(target[0]-desired) <= arm["position_deadband_m"]+1e-6
 
 
 def test_rate_limit_is_reported_when_hand_exceeds_follow_speed(cfg):

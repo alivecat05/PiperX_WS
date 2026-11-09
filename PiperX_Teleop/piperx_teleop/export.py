@@ -116,6 +116,8 @@ def read_segments(source, allow_mock=False):
         if not rows or len(rows) != meta["frames"]:
             raise ValueError(f"Manifest/frame count mismatch: {path}")
         modern = meta["schema"] == "piperx.rgb_action.v2"
+        if any(not row.get("sample_valid", True) for row in rows):
+            raise ValueError(f"Episode contains missing-frame placeholders, not fresh synchronized data: {path}")
         if modern:
             check_action_csv(path, rows)
         with EpisodeFrames(path, meta) as frames:
