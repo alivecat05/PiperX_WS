@@ -1,11 +1,6 @@
-"""Offline tracking and bounded completion for fixed-camera HaWoR labeling.
-
-No interpolation or optimization is allowed across a capture-grid discontinuity.
-The learned infiller is provided by the pinned upstream HaWoR repository.
-"""
+"""Offline EgoHand crop tracking within continuous capture-grid segments."""
 
 import numpy as np
-from scipy.spatial.transform import Rotation, Slerp
 
 
 def contiguous_ranges(grid):
@@ -103,37 +98,3 @@ def track_boxes(detections, grid, max_gap=90):
                 boxes[side, a:b] = boxes[side, a - 1] * (1 - f) + boxes[side, b] * f
                 supported[side, a:b] = True
     return boxes, scores, observed, supported, gap_length
-
-
-def project_rotations(matrices):
-    u, _, vh = np.linalg.svd(matrices)
-    fix = np.ones(matrices.shape[:-2] + (3,))
-    fix[..., -1] = np.linalg.det(u @ vh)
-    return (u * fix[..., None, :]) @ vh
-
-
-def interpolate_parameters(data, valid):
-    """Finite SLERP initialization for a learned-completion window only."""
-    result = {k: np.asarray(v).copy() for k, v in data.items()}
-    n = valid.shape[1]
-    for side in range(2):
-        good = np.flatnonzero(valid[side])
-        if len(good) == 0:
-            raise ValueError(
-                "Each hand needs an observed anchor in the infiller window"
-            )
-        for key in ("trans", "betas"):
-            for j in range(result[key].shape[-1]):
-                result[key][side, :, j] = np.interp(
-                    np.arange(n), good, result[key][side, good, j]
-                )
-        for key in ("rot", "hand_pose"):
-            aa = result[key][side].reshape(n, -1, 3)
-            for joint in range(aa.shape[1]):
-                if len(good) == 1:
-                    aa[:, joint] = aa[good[0], joint]
-                else:
-                    aa[:, joint] = Slerp(good, Rotation.from_rotvec(aa[good, joint]))(
-                        np.clip(np.arange(n), good[0], good[-1])
-                    ).as_rotvec()
-    return result

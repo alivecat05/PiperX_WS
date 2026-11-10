@@ -2,97 +2,35 @@
   "schema": "human_label.model_sources.v1",
   "checked_at": "2026-11-07 Asia/Shanghai",
   "git_revisions": {
-    "HaWoR": {
-      "path": ".cache/HaWoR",
-      "revision": "66c7d4108d58a716deccd192cb7645170cdc7bd7",
-      "url": "https://github.com/ThunderVVV/HaWoR.git"
-    },
-    "ACE-Ego-Hand": {
-      "path": ".cache/ACE-Ego-Hand",
-      "revision": "59da83b58d58c3041b9ee0b35b5054866e33a990",
-      "url": "https://github.com/ggxxii/ACE-Ego-Hand.git"
-    },
-    "VideoX-Fun": {
-      "path": ".cache/ACE-Ego-Hand/third_party",
-      "revision": "e8c314fbfa494d0429bbef605c9f6112b79a7ead",
-      "url": "https://github.com/aigc-apps/VideoX-Fun.git"
-    },
     "NVIDIA-IsaacCapture": {
-      "path": ".cache/IsaacCapture",
+      "path": "model/IsaacCapture",
       "revision": "d10c8818c0d556bc79d4598b343e95bf9e3ed178",
       "url": "https://github.com/NVIDIA/IsaacCapture.git"
     },
     "DINOv3": {
-      "path": ".cache/dinov3",
+      "path": "model/dinov3",
       "revision": "5aa7e93ab42ae3526291f6b4e3fcd22637e03326",
       "url": "https://github.com/facebookresearch/dinov3.git"
-    },
-    "WiLoR-mini": {
-      "path": ".cache/WiLoR-mini",
-      "revision": "ebec42f94c389070cdd7dda6fd1bf0b4a659c960",
-      "url": "https://github.com/warmshao/WiLoR-mini.git"
     }
   },
   "verified_files": [
     {
-      "file": ".cache/weights/external/detector.pt",
+      "file": "model/weights/external/detector.pt",
       "sha256": "5ef3df44e42d2db52d4ffe91f83a22ce9925e2acc9abebf453f2c5d22e380033",
       "repository_revision": "da6335f47f9806308992d5ae1002a4cc5f7252c2"
     },
     {
-      "file": ".cache/weights/hawor/checkpoints/hawor.ckpt",
-      "sha256": "4d1cc43853c190d6f2c10d9b6295c73109f0faf9ef41ac817a2b31d94b4823f2",
-      "repository_revision": "da6335f47f9806308992d5ae1002a4cc5f7252c2"
-    },
-    {
-      "file": ".cache/weights/hawor/checkpoints/infiller.pt",
-      "sha256": "30715e7e72e91d4e164bb762c7ea613dcff5448dbda5fabf40b4054e408cc5c2",
-      "repository_revision": "da6335f47f9806308992d5ae1002a4cc5f7252c2"
-    },
-    {
-      "file": ".cache/ACE-Ego-Hand/checkpoints/ace_ego_hand_kfree.pt",
-      "sha256": "0923760833ec3aa395f71f898be48299a33062c1c9e7935a697daeb8cd023020",
-      "repository_revision": "6fb3decade1b0331048fa9d02df605e95a0575c2"
-    },
-    {
-      "file": ".cache/ACE-Ego-Hand/ckpt/Wan2.2-Fun-5B-Control/Wan2.2_VAE.pth",
-      "sha256": "20eb789667fa5e60e7516bf509512f6cb61f01b0aa0695eadaea930c13892b36",
-      "repository_revision": "b8bc1a65ab71d054ba4636dc0dac104aa4df2686"
-    },
-    {
-      "file": ".cache/ACE-Ego-Hand/ckpt/Wan2.2-Fun-5B-Control/diffusion_pytorch_model.safetensors",
-      "sha256": "ace4718a7c87ee3e5606a68ab79142c4395e81aece76b8120bc886f0fbbe1d16",
-      "repository_revision": "b8bc1a65ab71d054ba4636dc0dac104aa4df2686"
-    },
-    {
-      "file": ".cache/ACE-Ego-Hand/ckpt/Wan2.2-Fun-5B-Control/models_t5_umt5-xxl-enc-bf16.pth",
-      "sha256": "7cace0da2b446bbbbc57d031ab6cf163a3d59b366da94e5afe36745b746fd81d",
-      "repository_revision": "b8bc1a65ab71d054ba4636dc0dac104aa4df2686"
-    },
-    {
-      "file": ".cache/egohand/egohand_s060000.ckpt",
+      "file": "model/egohand/egohand_s060000.ckpt",
       "sha256": "f940ecb6e3b73d5bd9e562cff232550e1c072f6c063eb4f705951122b15d8a75",
       "repository_revision": "a153616c5192e6a8b09dbd302f682093080c5b83"
     }
   ],
   "precision": {
-    "hawor": "fp32 weights with fp16 CUDA autocast; fp32 output",
-    "wilor": "fp32 CUDA inference",
-    "ace": "bf16 Wan backbone and fp32 hand decoder; official mixed precision",
     "egohand": "bf16 model autocast; fp32 SOMA/MHR geometry"
   },
   "adaptations": [
     "Fixed head optical frame; moving-camera SLAM omitted",
-    "Overlapping HaWoR windows protect upstream mutable left-hand crop centers",
-    "Mathematically reflected right MANO used for left; verified articulation/shape equivalence",
-    "ACE keeps raw occluded 3D predictions instead of dropping them on in-frame visibility",
-    "ACE executes only the official tapped 16 blocks; unused later blocks removed after loading all 605 adaptation tensors",
-    "VideoX-Fun package imports limited to the three executed Wan components; low-memory weight loading",
-    "CUDA transformer blocks can stream from CPU memory to fit the shared RTX 4090 D; weights and resolution retained",
-    "SOMA and MANO representations are saved separately",
-    "Native causal VAE 1+4 frame input streaming bounds GPU memory; 5-frame latent parity test has exactly zero maximum error (see .cache/vae_streaming_parity.json)",
     "EgoHand context enhancement interpolates only crop boxes in capture grid time (3 s interior, 0.25 s edges); current RGB is inferred, native pose smoothing stays within each capture segment",
-    "Local CUDA MANO temporal fitting batches independent capture segments with an explicit adjacency mask; no cross-gap acceleration terms",
     "Current-frame camera wrist epose exported with PiperCapture 17-column schema and per-side gripper limits; local config.example.json specifies 0.07 m. Raw pinch distance is preserved.",
     "Corrected SOMA epose rotations using official FK root A.T @ R_native @ A. Native SOMA parameter archives stay intact; camera transforms are saved separately in wrist_epose.npz. Official FK parity max error < 1e-7."
   ]

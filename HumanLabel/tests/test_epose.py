@@ -16,6 +16,9 @@ from humanlabel.export import (
     wrist_values,
     write_csv,
 )
+from humanlabel.export import (
+    main as export_main,
+)
 from humanlabel.utils.paths import ROOT
 
 
@@ -89,13 +92,12 @@ def test_soma_camera_rotation_matches_official_fk_and_camera_covariance():
     np.testing.assert_allclose(
         camera_wrist_rotations(restored, "SOMA"), camera_rotation @ expected, atol=3e-7
     )
-    np.testing.assert_array_equal(camera_wrist_rotations(native, "MANO"), native)
 
 
 def test_saved_epose_preserves_frame_alignment_and_uses_fk_not_raw_soma_rotation(
     tmp_path,
 ):
-    source, output, backup = [tmp_path / s for s in ("source", "output", "backup")]
+    source, output = [tmp_path / s for s in ("source", "output")]
     source.mkdir()
     output.mkdir()
     stamps = ["100.000000001", "100.100000001"]
@@ -126,15 +128,22 @@ def test_saved_epose_preserves_frame_alignment_and_uses_fk_not_raw_soma_rotation
         "representation": "SOMA",
     }
     (output / "manifest.json").write_text(json.dumps(meta))
-    update_episode(output, capture_contract(), backup)
+    update_episode(output, capture_contract())
     assert validate_products(output)["status"] == "passed"
     assert list(csv.reader((output / "epose.csv").open())) == list(
         csv.reader((output / "action_raw.csv").open())
     )
-    prior = np.asarray(list(csv.reader((backup / "action.csv").open()))[1:])
-    assert float(prior[0, 8]) == pytest.approx(0.1)
     current = list(csv.reader((output / "epose.csv").open()))
     assert current[1][0] == stamps[0] and float(current[1][8]) == pytest.approx(0.07)
     # Rerunning must accept already-converted camera wrist quaternions.
-    update_episode(output, capture_contract(), backup)
+    update_episode(output, capture_contract())
     assert validate_products(output)["status"] == "passed"
+    assert {path.name for path in tmp_path.iterdir()} == {"source", "output"}
+
+    # Re-exporting the result root discovers parent-folder groups without backups.
+    group = tmp_path / "result/recordings"
+    group.mkdir(parents=True)
+    output.rename(group / "episode_001")
+    export_main([str(group.parent)])
+    assert (group / "summary.json").is_file()
+    assert {path.name for path in group.parent.iterdir()} == {"recordings"}

@@ -10,29 +10,33 @@ import cv2
 import numpy as np
 
 from humanlabel.utils.camera import camera_model
-from humanlabel.utils.episode import ROOT, detections, export, read_episode, save_npz
+from humanlabel.utils.episode import detections, export, read_episode, save_npz
+from humanlabel.utils.paths import MODEL, ROOT
 from humanlabel.utils.tracking import contiguous_ranges, track_boxes
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "source", nargs="?", type=Path, default=ROOT / "human demonstration"
+        "source", nargs="?", type=Path, default=ROOT / "human_demonstration"
     )
-    parser.add_argument("--output", type=Path, default=ROOT / "result/egohand")
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--episodes", nargs="+", help="Process only these episode names"
+    )
     args = parser.parse_args(argv)
     import torch
 
-    repo = ROOT / ".cache/IsaacCapture/src/python/isaaccapture_egopost"
+    repo = MODEL / "IsaacCapture/src/python/isaaccapture_egopost"
     sys.path.insert(0, str(repo))
-    sys.path.insert(0, str(ROOT / ".cache/dinov3"))
+    sys.path.insert(0, str(MODEL / "dinov3"))
     torch.set_num_threads(8)
     from inference.camera.camera_models import load_camera_calibration
     from inference.pipeline.predictor import EgoHandPredictor
 
     predictor = EgoHandPredictor.from_checkpoint(
-        ROOT / ".cache/egohand/egohand_s060000.ckpt",
-        ROOT / ".cache/egohand/soma",
+        MODEL / "egohand/egohand_s060000.ckpt",
+        MODEL / "egohand/soma",
         batch_size=4,
         device="cuda",
         dtype=torch.bfloat16,
@@ -40,7 +44,7 @@ def main(argv=None):
         use_perspective_cropping=True,
     )
     predictor.model.eval().requires_grad_(False)
-    assets = np.load(ROOT / ".cache/egohand/soma/SOMAHand.npz", allow_pickle=True)
+    assets = np.load(MODEL / "egohand/soma/SOMAHand.npz", allow_pickle=True)
     faces = {
         0: assets["left_triangles"].astype(np.int32),
         1: assets["right_triangles"].astype(np.int32),
@@ -55,6 +59,8 @@ def main(argv=None):
         if (args.source / "head.mp4").exists()
         else sorted(args.source.glob("episode_*/"))
     )
+    if args.episodes:
+        episodes = [episode for episode in episodes if episode.name in args.episodes]
     summaries = []
     for episode in episodes:
         output = args.output / episode.name
@@ -80,7 +86,7 @@ def main(argv=None):
             "camera_fixed": True,
             "left_template": "native SOMAHand left/right rig",
             "dtype": "bfloat16 model autocast; fp32 rig geometry",
-            "pose_convention": "SOMA wrist root in head optical camera frame; meters, quaternion xyzw; SOMA root axes differ from MANO",
+            "pose_convention": "SOMA wrist root in head optical camera frame; meters, quaternion xyzw; native root axes converted by SOMA FK for epose",
             "code_revision": "d10c8818c0d556bc79d4598b343e95bf9e3ed178",
             "soma25_to_preview21": order,
             "identity_model_type": predictor.model.soma_hand.identity_model_type,
@@ -99,7 +105,11 @@ def main(argv=None):
         )
         try:
             ds, paths = detections(
-                episode, rows, size, ROOT / ".cache/weights/external/detector.pt"
+                episode,
+                rows,
+                size,
+                MODEL / "weights/external/detector.pt",
+                args.output.parent / "frames" / episode.name,
             )
             grid = np.array([int(r["grid_index"]) for r in rows])
             boxes, scores, observed, supported, gap_length = track_boxes(ds, grid, 90)

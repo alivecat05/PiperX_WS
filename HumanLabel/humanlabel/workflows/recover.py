@@ -2,7 +2,7 @@
 
 Only crop coordinates are interpolated across acquisition gaps. Poses are
 inferred from existing RGB frames; native smoothing never crosses those gaps.
-The original EgoHand results are preserved in a separate directory.
+Native predictions and extracted frames come from the run's temporary directory.
 """
 
 import argparse
@@ -14,7 +14,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from humanlabel.utils.episode import ROOT, export, read_episode, save_npz
+from humanlabel.utils.episode import export, read_episode, save_npz
+from humanlabel.utils.paths import MODEL
 from humanlabel.utils.tracking import contiguous_ranges, track_boxes
 
 
@@ -45,14 +46,15 @@ def crop_candidates(
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--source", type=Path, default=ROOT / "result/egohand")
-    p.add_argument("--output", type=Path, default=ROOT / "result/egohand_context")
+    p.add_argument("--source", type=Path, required=True)
+    p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--episodes", nargs="+", help="Process only these episode names")
     args = p.parse_args(argv)
     import torch
 
     sys.path[:0] = [
-        str(ROOT / ".cache/IsaacCapture/src/python/isaaccapture_egopost"),
-        str(ROOT / ".cache/dinov3"),
+        str(MODEL / "IsaacCapture/src/python/isaaccapture_egopost"),
+        str(MODEL / "dinov3"),
     ]
     torch.set_num_threads(8)
     from inference.camera.camera_models import load_camera_calibration
@@ -61,6 +63,8 @@ def main(argv=None):
     predictor = None
     summaries = []
     for folder in sorted(args.source.glob("episode_*")):
+        if args.episodes and folder.name not in args.episodes:
+            continue
         output = args.output / folder.name
         if (output / "manifest.json").exists() and json.loads(
             (output / "manifest.json").read_text()
@@ -72,7 +76,7 @@ def main(argv=None):
         assert meta["status"] == "complete" and meta["representation"] == "SOMA"
         meta.update(
             status="processing",
-            parent_result=str(folder.resolve()),
+            processing_chain=["EgoHand", "native smoothing", "context crops", "epose"],
             backend="NVIDIA EgoHand + context crops",
             device="cuda",
             gpu_name=torch.cuda.get_device_name(0),
@@ -85,7 +89,9 @@ def main(argv=None):
         _, rows, size, fps, n = read_episode(episode)
         if not (folder / "tracking.npz").exists():
             cached = json.loads(
-                (ROOT / ".cache/head" / folder.name / "detections.json").read_text()
+                (
+                    args.source.parent / "frames" / folder.name / "detections.json"
+                ).read_text()
             )["detections"]
             grid = np.array([int(r["grid_index"]) for r in rows])
             values = track_boxes(
@@ -137,8 +143,8 @@ def main(argv=None):
             if added.any():
                 if predictor is None:
                     predictor = EgoHandPredictor.from_checkpoint(
-                        ROOT / ".cache/egohand/egohand_s060000.ckpt",
-                        ROOT / ".cache/egohand/soma",
+                        MODEL / "egohand/egohand_s060000.ckpt",
+                        MODEL / "egohand/soma",
                         batch_size=4,
                         device="cuda",
                         dtype=torch.bfloat16,
@@ -169,7 +175,11 @@ def main(argv=None):
                     for i in indices
                 }
                 images = [
-                    cv2.imread(str(ROOT / ".cache/head" / folder.name / f"{i:06d}.jpg"))
+                    cv2.imread(
+                        str(
+                            args.source.parent / "frames" / folder.name / f"{i:06d}.jpg"
+                        )
+                    )
                     for i in indices
                 ]
                 times = {
@@ -243,11 +253,6 @@ def main(argv=None):
                 tracking["gap_length"],
                 matrix,
                 meta,
-            )
-            save_npz(output / "tracking.npz", tracking)
-            save_npz(
-                output / "prediction_raw.npz",
-                {**pred, "joints_camera_m": joints, "vertices_camera_m": vertices},
             )
             meta.update(
                 status="complete",

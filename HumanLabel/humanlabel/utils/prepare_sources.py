@@ -8,14 +8,9 @@ from humanlabel.utils.paths import ROOT
 
 DEPENDENCIES = {
     "egohand": ["NVIDIA-IsaacCapture", "DINOv3"],
-    "hawor": ["HaWoR"],
-    "ace": ["ACE-Ego-Hand", "VideoX-Fun"],
-    "wilor": ["WiLoR-mini"],
 }
 PATCHES = {
     "NVIDIA-IsaacCapture": "IsaacCapture.patch",
-    "ACE-Ego-Hand": "ACE-Ego-Hand.patch",
-    "VideoX-Fun": "VideoX-Fun.patch",
 }
 
 

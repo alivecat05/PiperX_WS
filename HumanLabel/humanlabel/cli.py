@@ -1,4 +1,4 @@
-"""Public command dispatch; optional GPU models load only for their workflow."""
+"""EgoHand annotation, native smoothing, context-crop recovery and epose export."""
 
 import argparse
 import importlib
@@ -13,37 +13,9 @@ COMMANDS = {
         "humanlabel.export",
         "Re-export existing geometry as PiperCapture-format camera wrist eposes",
     ),
-    "egohand": (
-        "humanlabel.workflows.egohand",
-        "Run only the native EgoHand inference stage",
-    ),
-    "recover": (
-        "humanlabel.workflows.recover",
-        "Recover missed crops from existing EgoHand results",
-    ),
-    "compare": (
-        "humanlabel.visualization.runner",
-        "Run optional baselines and produce full comparison videos",
-    ),
-    "compare-videos": (
-        "humanlabel.visualization.compare",
-        "Validate and compare already-completed model videos",
-    ),
-    "temporal": (
-        "humanlabel.visualization.temporal",
-        "Run the HaWoR, ACE or WiLoR comparison backend",
-    ),
-    "refine": (
-        "humanlabel.visualization.refine",
-        "Fit an existing MANO sequence on CUDA",
-    ),
-    "render": (
-        "humanlabel.visualization.render",
-        "Re-render saved predictions with the matching camera estimates",
-    ),
     "prepare-sources": (
         "humanlabel.utils.prepare_sources",
-        "Clone pinned optional upstream sources and apply compatibility patches",
+        "Clone pinned EgoHand upstream sources and apply compatibility patches",
     ),
 }
 

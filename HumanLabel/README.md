@@ -2,9 +2,11 @@
 
 将 head 视频标注为 **腕部在相机系下的 epose＋拇指/食指距离**。
 
-## 1. 当前使用的方案
+## 1. 标注链路
 
 **EgoHand → native smoothing → 前后帧裁剪恢复 → epose 导出**
+
+本项目只提供这一条链路。`label` 对每个片段执行完整流程，支持单片段和整批 `episode_*` 目录。
 
 | 项目 | 说明 |
 |---|---|
@@ -17,46 +19,137 @@
 
 ## 2. 环境配置
 
-本机已验证：**Linux、Python 3.13、PyTorch 2.7.1/cu126、RTX 4090 D 24 GB**。
-以下命令在 `HumanLabel/` 执行；默认流程不需要 MediaPipe、OpenVINO 或 HaWoR 环境。
+运行条件：**Linux、NVIDIA GPU、支持所选 PyTorch CUDA 构建的驱动**，以及 Git。环境管理推荐 Conda（Miniconda / Anaconda），也可使用下文的 venv 方案。
+已有验证配置为 **Python 3.13、PyTorch 2.7.1/cu126、RTX 4090 D 24 GB**；这不代表已验证所有 GPU 或最低显存需求。
+
+### 2.1 获取代码并进入模块所在目录
+
+首次获取本仓库：
+
+```bash
+git clone https://github.com/alivecat05/PiperX_WS.git
+cd PiperX_WS/HumanLabel
+```
+
+如果已经克隆，直接进入其中的 `HumanLabel/`，不必再次克隆。
+**下文所有命令都在 `HumanLabel/` 执行**，该目录下应能看到 `humanlabel/` 和 `requirements.txt`。
+目前按源码目录运行模块；仅安装依赖后，从其他目录执行仍可能提示找不到 `humanlabel`。
+
+### 2.2 创建自己的环境并安装依赖
+
+按顺序完成本节的全部安装、第 2.3 节的模型资源准备，最后在第 2.4 节统一校验。
+
+先安装 OpenCV 系统运行库。Ubuntu / Debian 上执行（需要管理员权限；root 用户去掉 `sudo`）：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y libgl1 libglib2.0-0
+```
+
+缺少 `libgl1` 时，`import cv2` 会报 `libGL.so.1` 找不到。无管理员权限时，由服务器或容器维护者预装这些库。
+
+每位使用者都需要创建自己的环境，仓库不包含开发者的虚拟环境。
+推荐使用 Conda；以下命令从新建环境开始，**不要直接在 `(base)` 中安装**：
+
+```bash
+conda create -n humanlabel python=3.13 pip -y
+conda activate humanlabel
+# 忽略 ~/.local 中其他项目的 Python 包，防止串用 OpenCV 等依赖。
+conda env config vars set PYTHONNOUSERSITE=1
+conda deactivate
+conda activate humanlabel
+
+python -m pip install --upgrade pip
+python -m pip install torch==2.7.1 torchvision==0.22.1 \
+  --index-url https://download.pytorch.org/whl/cu126
+python -m pip install -r requirements.txt -r requirements-egohand.txt
+```
+
+如果已经自行创建并安装过这个 Conda 环境，后续只需 `conda activate humanlabel`。
+不同 GPU / 驱动需要选择兼容的 PyTorch CUDA 构建。
+
+`requirements.txt` 已固定普通版 `opencv-python`，上述安装命令会一并安装。
+
+<details>
+<summary>不用 Conda：从零创建 venv（二选一）</summary>
+
+需要预先安装 Python 3.13 及其 `venv` 支持。先创建，再激活：
 
 ```bash
 python3.13 -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install torch==2.7.1 torchvision==0.22.1 \
-  --index-url https://download.pytorch.org/whl/cu126
-python -m pip install -r requirements.txt
-python -m pip install -r requirements-egohand.txt
-
-# 检查 GPU，再准备固定版本源码。
-python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
-python -m humanlabel prepare-sources --models egohand
 ```
 
-**还需模型权重和 SOMA 资源**。下载地址、版本及目录见 [模型资源配置](docs/SETUP.md)。
-源码、权重与运行环境均保留在 `.cache/` / 虚拟环境中，不提交到 Git。
+然后执行上面从 `python -m pip install --upgrade pip` 开始的依赖安装命令。
+`.venv/` 在你的机器上生成，不随 Git 分发；只有创建成功后才会存在 `.venv/bin/activate`。
+以后打开新终端时，在 `HumanLabel/` 中重新执行 `source .venv/bin/activate`。
 
-> 本机继续使用已有 `.ace-venv/bin/python` 即可，无需重复安装。不同 GPU/驱动需安装兼容的 PyTorch CUDA 构建。
+</details>
 
-## 3. 运行当前方案
+### 2.3 准备模型资源（首次运行必做）
+
+在刚才激活的环境中执行：
 
 ```bash
-# 全部视频：默认读取 human demonstration/，结果写入 result/。
-python -m humanlabel label
-
-# 指定数据及输出目录。
-python -m humanlabel label /path/to/episodes --output /path/to/result
-
-# 只从已有几何结果重新导出；不重新执行 GPU 推理。
-python -m humanlabel export result/best
+python -m humanlabel prepare-sources
 ```
 
-已完成片段会复用。`result/best/` 指向最终的 EgoHand 增强结果。
+`prepare-sources` 只准备第三方源码，**不会下载模型权重**。
+继续执行 [模型资源配置第 2、3 步](docs/SETUP.md#2-权重和-soma-资源)，下载 EgoHand checkpoint、SOMA/MHR 资源及手部检测器，检查目录后再运行标注。
+第三方源码、模型权重及 SOMA/MHR 资源统一保存在本仓库的 `model/` 中；Conda 环境由 Conda 管理，venv 则保存在你创建的目录中。这些内容均不提交到 Git。
+
+### 2.4 全部安装完成后统一校验
+
+完成上述依赖安装和模型资源准备后，在同一环境中执行：
+
+```bash
+python -m pip check
+python -m humanlabel --help
+python -c "import sys, cv2; print(sys.executable); print(cv2.__version__, cv2.__file__)"
+python -c "import torch; print(torch.__version__); assert torch.cuda.is_available(), 'CUDA 不可用，请检查 NVIDIA 驱动和 PyTorch 安装'; print(torch.cuda.get_device_name(0))"
+```
+
+确认没有依赖冲突、OpenCV 能导入、CUDA 可用，并按资源说明核对模型文件目录后，进入第 3 节运行标注。
+
+## 3. 单片段与批量处理
+
+确认已完成依赖和模型资源安装，进入 `HumanLabel/` 并激活自己的环境。
+命令格式为 **`python -m humanlabel label "输入目录" --output "输出目录"`**。
+模块名是 `humanlabel`，`label` 是子命令。输入路径使用你自己的实际目录名。
+引号内不要额外添加空格：`"/path/to/episodes"` 与 `" /path/to/episodes"` 是不同的路径。
+
+```bash
+# 批量处理：输入目录下包含 episode_001/、episode_002/ 等片段。
+python -m humanlabel label "/path/to/episodes" --output "/path/to/result"
+
+# 单个片段。
+python -m humanlabel label "human_demonstration/episode_004" --output ./result
+
+# 只从已有几何结果重新导出；不重新执行 GPU 推理。
+python -m humanlabel export result/human_demonstration
+```
+
+输入可以是包含多个 `episode_*` 的父目录，也可以是单个片段目录；每个片段需要 `head.mp4`、`timestamps.csv`、`manifest.json`。
+录像不随仓库提供，需要自行准备。`./result` 表示当前目录下的输出文件夹；`/result` 则是系统根目录下的文件夹，需要相应写入权限。
+
+最终结果按 **`输出目录/原母文件夹名/episode_XXX/`** 保存。例如，输入 `human_demonstration/` 或其中的 `episode_004/`，并指定 `--output ./result`：
+
+```text
+result/
+└── human_demonstration/
+    ├── episode_004/          # 完整链路的最终结果
+    ├── episode_005/
+    ├── summary.json
+    └── validation_all.json
+```
+
+每个片段只保留裁剪恢复及 epose 导出后的最终结果。已完成片段会直接复用。
+运行中的抽帧、检测记录和原生预测临时写入 `.cache/`；本次运行结束或失败时自动清除自己的临时目录，全部任务结束后移除空的 `.cache/`。
+模型和上游源码保留在 `model/`，供后续批量处理使用。
 
 ## 4. 输出格式
 
-每段保存到 `result/best/episode_XXX/`：
+每段保存到 `result/原母文件夹名/episode_XXX/`：
 
 | 文件 | 内容 |
 |---|---|
@@ -96,39 +189,16 @@ humanlabel/
 ├── cli.py                 # 命令入口与路由
 ├── export.py              # 相机系 epose、PiperCapture 格式及校验
 ├── workflows/             # 当前方案：推理、恢复、完整流水线
-├── backends/              # 可选对比模型适配
-├── utils/                 # 相机、时间戳、跟踪、几何与资源工具
-└── visualization/         # 算法对比、视频合成、重绘与可选优化
+├── validation.py          # 完整性、时间戳、采集缺口和预览校验
+└── utils/                 # 相机、时间戳、裁剪跟踪、视频导出和资源准备
+model/                     # EgoHand 权重、SOMA/MHR、检测器和必需的上游源码（不提交 Git）
 configs/                   # 模型版本、校验值与 SOMA 参考轴
-docs/                      # 环境/资源细节及算法选型记录
+docs/                      # EgoHand 环境与模型资源说明
 patches/                   # 固定上游版本的兼容性补丁
 tests/                     # 几何、格式、跟踪与导出测试
 ```
 
-## 6. 其他方法与对比视频
-
-| 方法 | 用途 |
-|---|---|
-| WiLoR / MANO | 单帧基线 |
-| HaWoR＋infiller | 时序估计与学习补全 |
-| ACE-Ego-Hand K-free | 不依赖检测框的视频手部恢复 |
-| ACE＋本地时序拟合 | 可选 CUDA 优化；不是官方 Dyn-HaMR |
-
-```bash
-# 对已有输出生成完整对比视频，无需加载模型权重。
-python -m humanlabel compare --render-only --enhanced
-
-# 重新执行全部对比模型；每个模型的独立环境见 docs/SETUP.md。
-python -m humanlabel compare --enhanced \
-  --wilor-python /path/to/wilor/bin/python \
-  --hawor-python /path/to/hawor/bin/python
-```
-
-对比产物位于 `result/comparison/` 或 `result/comparison_all/`。
-[选型记录](docs/model_comparison.json)包含可用性、来源和引用数快照；无可用代码或必要权重的方法不纳入实测。
-连续性指标不等于三维精度排名。
-
-## 7. 测试与资源许可
+## 6. 测试与资源许可
 
 ```bash
 python -m pip install -r requirements-dev.txt
@@ -136,5 +206,5 @@ python -m pytest -q
 python -m ruff check humanlabel tests
 ```
 
-权重、SOMA/MANO 及第三方源码适用各自上游许可，见 [模型资源配置](docs/SETUP.md)。
-录制数据、模型、缓存、虚拟环境和 `result/` 不上传 GitHub。
+权重、SOMA/MHR 及第三方源码适用各自上游许可，见 [模型资源配置](docs/SETUP.md)。
+录制数据、`model/`、运行时临时目录、虚拟环境和 `result/` 不上传 GitHub。

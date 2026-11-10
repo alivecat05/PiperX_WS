@@ -4,14 +4,13 @@ import argparse
 import csv
 import hashlib
 import json
-import shutil
 from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from humanlabel.utils.paths import ROOT
+from humanlabel.utils.paths import MODEL, ROOT
 
 SIDES = ("left", "right")
 HEADER = [
@@ -60,7 +59,7 @@ def capture_contract(config=None):
 def soma_axes():
     data = json.loads((ROOT / "configs/soma_wrist_axes.json").read_text())
     for name, digest in data["asset_sha256"].items():
-        asset = ROOT / ".cache/egohand/soma" / name
+        asset = MODEL / "egohand/soma" / name
         if asset.exists() and hashlib.sha256(asset.read_bytes()).hexdigest() != digest:
             raise ValueError(f"SOMA reference axes do not match asset: {name}")
     axes = np.asarray([data["A"][s] for s in SIDES])
@@ -71,7 +70,7 @@ def soma_axes():
 
 def camera_wrist_rotations(native_roots, representation):
     if representation != "SOMA":
-        return native_roots.copy()
+        raise ValueError("Only EgoHand SOMA predictions are supported")
     # SOMA's FK applies the T-pose joint orientation, including at root 0.
     # Root parent is itself: R_camera = A.T @ R_parameter @ A.
     a = soma_axes()[:, None]
@@ -79,16 +78,12 @@ def camera_wrist_rotations(native_roots, representation):
 
 
 def rotation_contract(contract, representation):
+    if representation != "SOMA":
+        raise ValueError("Only EgoHand SOMA predictions are supported")
     return {
         **contract,
-        "rotation_conversion": (
-            "SOMA FK root: A.T @ native_root_rotation @ A; A from soma_wrist_axes.json"
-            if representation == "SOMA"
-            else "native MANO global wrist rotation"
-        ),
-        "wrist_axes_reference": str(ROOT / "configs/soma_wrist_axes.json")
-        if representation == "SOMA"
-        else "native MANO bind wrist",
+        "rotation_conversion": "SOMA FK root: A.T @ native_root_rotation @ A; A from soma_wrist_axes.json",
+        "wrist_axes_reference": str(ROOT / "configs/soma_wrist_axes.json"),
     }
 
 
@@ -179,7 +174,7 @@ def write_products(
     temporary.replace(folder / "wrist_epose.npz")
 
 
-def update_episode(folder, contract, backup):
+def update_episode(folder, contract):
     meta_path = folder / "manifest.json"
     meta = json.loads(meta_path.read_text())
     if meta["status"] != "complete":
@@ -190,16 +185,14 @@ def update_episode(folder, contract, backup):
     n = meta["processed_frames"]
     if len(timestamps) != n:
         raise ValueError("Source/result frame counts differ")
-    archive = folder / (
-        "soma.npz" if meta.get("representation") == "SOMA" else "mano.npz"
-    )
+    archive = folder / "soma.npz"
     with np.load(archive) as d:
         joints, native_roots, valid = (
             d["joints_camera_m"],
             d["rotmat"][:, :, 0],
             d["model_valid"],
         )
-        roots = camera_wrist_rotations(native_roots, meta.get("representation", "MANO"))
+        roots = camera_wrist_rotations(native_roots, meta["representation"])
         values, pinch, transforms = wrist_values(
             joints, roots, valid, contract["gripper_max_m"]
         )
@@ -241,16 +234,6 @@ def update_episode(folder, contract, backup):
         quality = list(reader)
     if len(quality) != n:
         raise ValueError("Quality/frame count disagreement")
-    backup.mkdir(parents=True, exist_ok=True)
-    for name in (
-        "action.csv",
-        "action_raw.csv",
-        "quality.csv",
-        "manifest.json",
-        "validation.json",
-    ):
-        if (folder / name).exists() and not (backup / name).exists():
-            shutil.copy2(folder / name, backup / name)
     stamps = [r["timestamp_unix_s"] for r in timestamps]
     records = [[stamp, *row] for stamp, row in zip(stamps, values)]
     for i, row in enumerate(quality):
@@ -274,7 +257,7 @@ def update_episode(folder, contract, backup):
         contract,
     )
     meta.update(
-        epose_export=rotation_contract(contract, meta.get("representation", "MANO")),
+        epose_export=rotation_contract(contract, meta["representation"]),
         pose_convention="T_C_W: bind-wrist axes to head optical camera; origin=joint 0; joint-orient conversion in epose_export; +X right +Y down +Z forward; meters; quaternion xyzw",
         action_semantics="current-frame estimated camera wrist epose; not PiperCapture next-grid measured TCP",
         robot_base_calibrated=False,
@@ -313,14 +296,10 @@ def validate_products(folder):
         raw = list(csv.reader(f))
     assert epose == raw and epose[0] == HEADER
     values = np.asarray([r[1:] for r in epose[1:]], float)
-    archive = folder / (
-        "soma.npz" if meta.get("representation") == "SOMA" else "mano.npz"
-    )
+    archive = folder / "soma.npz"
     with np.load(archive) as d:
         joints, valid = d["joints_camera_m"], d["model_valid"]
-        roots = camera_wrist_rotations(
-            d["rotmat"][:, :, 0], meta.get("representation", "MANO")
-        )
+        roots = camera_wrist_rotations(d["rotmat"][:, :, 0], meta["representation"])
     with (folder / "pinch.csv").open() as f:
         pinch_rows = list(csv.DictReader(f))
     with (folder / "quality.csv").open() as f:
@@ -383,12 +362,31 @@ def validate_products(folder):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("roots", nargs="*", type=Path, default=[ROOT / "result/best"])
+    p.add_argument("roots", nargs="*", type=Path, default=[ROOT / "result"])
     p.add_argument("--piper-config", type=Path)
     args = p.parse_args(argv)
     contract = capture_contract(args.piper_config)
+    roots = []
     for root in args.roots:
         root = root.resolve()
+        if (root / "manifest.json").exists() or any(
+            root.glob("episode_*/manifest.json")
+        ):
+            roots.append(root)
+        else:
+            groups = (
+                sorted(
+                    folder
+                    for folder in root.iterdir()
+                    if folder.is_dir() and any(folder.glob("episode_*/manifest.json"))
+                )
+                if root.is_dir()
+                else []
+            )
+            if not groups:
+                p.error(f"No episodes in {root}")
+            roots.extend(groups)
+    for root in roots:
         folders = (
             [root]
             if (root / "manifest.json").exists()
@@ -398,8 +396,7 @@ def main(argv=None):
             p.error(f"No episodes in {root}")
         reports, metas = {}, []
         for folder in folders:
-            backup = ROOT / ".cache/epose_before_pipercapture" / root.name / folder.name
-            meta, report = update_episode(folder, contract, backup)
+            meta, report = update_episode(folder, contract)
             report.update(validate_products(folder))
             (folder / "epose_validation.json").write_text(json.dumps(report, indent=2))
             reports[folder.name] = report

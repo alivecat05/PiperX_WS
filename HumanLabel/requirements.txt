@@ -1,5 +1,4 @@
-# Shared geometry, export, video validation and tests; GPU runtime is separate.
+# EgoHand geometry, export, video validation and tests; GPU runtime is separate.
 numpy>=2,<3
 scipy>=1.13,<2
 opencv-python==4.11.0.86
-imageio-ffmpeg==0.6.0

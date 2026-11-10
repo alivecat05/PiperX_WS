@@ -3,8 +3,11 @@
 __pycache__/
 .pytest_cache/
 .cache/
+model/
+.ruff_cache/
 result/
 human demonstration/
+human_demonstration/
 humandemonstrate/
 *.mp4
 *.avi

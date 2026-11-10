@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from humanlabel.utils.paths import ROOT
+from humanlabel.utils.paths import ROOT, temporary_workspace
 
 
 def complete_for(folder, source):
@@ -23,45 +23,75 @@ def complete_for(folder, source):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "source", nargs="?", type=Path, default=ROOT / "human demonstration"
+        "source", nargs="?", type=Path, default=ROOT / "human_demonstration"
     )
     parser.add_argument("--output", type=Path, default=ROOT / "result")
     parser.add_argument("--piper-config", type=Path)
     args = parser.parse_args(argv)
     source, output = args.source.resolve(), args.output.resolve()
+    single_episode = (source / "head.mp4").exists()
+    dataset = source.parent if single_episode else source
     episodes = (
-        [source] if (source / "head.mp4").exists() else sorted(source.glob("episode_*"))
+        [source]
+        if single_episode
+        else sorted(p for p in source.glob("episode_*") if p.is_dir())
     )
     if not episodes:
         parser.error(f"No head-view episodes in {source}")
-    native, recovered = output / "egohand", output / "egohand_context"
-    if not all(complete_for(native / p.name, p) for p in episodes):
+    final = output / dataset.name
+    for episode in episodes:
+        manifest = final / episode.name / "manifest.json"
+        if manifest.exists():
+            recorded_source = Path(json.loads(manifest.read_text()).get("source", ""))
+            if recorded_source.resolve() != episode.resolve():
+                parser.error(f"Output belongs to another source: {manifest}")
+    pending = [p for p in episodes if not complete_for(final / p.name, p)]
+    if pending:
         from humanlabel.workflows.egohand import main as infer
-
-        infer([str(source), "--output", str(native)])
-    if not all(complete_for(recovered / p.name, p) for p in episodes):
         from humanlabel.workflows.recover import main as recover
 
-        recover(["--source", str(native), "--output", str(recovered)])
+        with temporary_workspace() as work:
+            native = work / "egohand"
+            infer(
+                [
+                    str(source),
+                    "--output",
+                    str(native),
+                    "--episodes",
+                    *[p.name for p in pending],
+                ]
+            )
+            recover(
+                [
+                    "--source",
+                    str(native),
+                    "--output",
+                    str(final),
+                    "--episodes",
+                    *[p.name for p in pending],
+                ]
+            )
     from humanlabel.export import main as export
 
-    arguments = [str(recovered / p.name) for p in episodes]
+    arguments = [str(final / p.name) for p in episodes]
     if args.piper_config:
         arguments += ["--piper-config", str(args.piper_config)]
     export(arguments)
-    from humanlabel.visualization.compare import validate
+    from humanlabel.validation import validate
 
-    reports = {p.name: validate(recovered / p.name) for p in episodes}
-    (recovered / "validation_all.json").write_text(json.dumps(reports, indent=2))
-    best = output / "best"
-    if best.is_symlink():
-        if best.resolve() != recovered.resolve():
-            raise ValueError(f"Existing best link points elsewhere: {best}")
-    elif best.exists():
-        raise ValueError(f"Preserve existing non-symlink result directory: {best}")
-    else:
-        best.symlink_to("egohand_context", target_is_directory=True)
+    reports_path = final / "validation_all.json"
+    reports = json.loads(reports_path.read_text()) if reports_path.exists() else {}
+    current_reports = {p.name: validate(final / p.name) for p in episodes}
+    reports.update(current_reports)
+    reports_path.write_text(json.dumps(reports, indent=2))
+    summaries = [
+        json.loads(path.read_text())
+        for path in sorted(final.glob("episode_*/manifest.json"))
+    ]
+    (final / "summary.json").write_text(
+        json.dumps(summaries, ensure_ascii=False, indent=2)
+    )
     print(
-        f"Camera wrist eposes ready: {best}; {sum(r['processed_frames'] for r in reports.values())} frames",
+        f"Camera wrist eposes ready: {final}; {sum(r['processed_frames'] for r in current_reports.values())} frames",
         flush=True,
     )

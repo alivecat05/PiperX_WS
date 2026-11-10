@@ -1,4 +1,4 @@
-"""Batch head-view annotation and reproducible full-length model comparison."""
+"""EgoHand video input, hand detection, geometry archives and preview export."""
 
 import csv
 import hashlib
@@ -18,7 +18,6 @@ from humanlabel.export import (
     write_products,
 )
 from humanlabel.utils.camera import timestamps
-from humanlabel.utils.paths import ROOT
 from humanlabel.utils.tracking import contiguous_ranges
 
 
@@ -38,9 +37,8 @@ def read_episode(episode, max_frames=0):
     return meta, rows[:n], size, fps, count
 
 
-def detections(episode, rows, size, detector_path):
+def detections(episode, rows, size, detector_path, cache):
     """Shared detector baseline; original frame indexes are never re-timed."""
-    cache = ROOT / ".cache/head" / episode.name
     cache.mkdir(parents=True, exist_ok=True)
     stat = (episode / "head.mp4").stat()
     signature = hashlib.sha256(
@@ -65,7 +63,7 @@ def detections(episode, rows, size, detector_path):
             ], paths
     import torch
 
-    os.environ.setdefault("YOLO_CONFIG_DIR", str(ROOT / ".cache/yolo"))
+    os.environ["YOLO_CONFIG_DIR"] = str(cache.parent.parent / "yolo")
     from ultralytics import YOLO
 
     torch.set_num_threads(8)
@@ -126,47 +124,6 @@ def save_npz(path, data):
     temp.replace(path)
 
 
-def infer_hawor(backend, paths, boxes, observed, supported, grid, matrix, output):
-    raw_path = output / "prediction_raw.npz"
-    if raw_path.exists():
-        with np.load(raw_path) as d:
-            raw = {k: d[k] for k in d.files}
-    else:
-        raw = backend.inference(paths, boxes, observed, supported, grid, matrix)
-        save_npz(raw_path, raw)
-    completed, fill = backend.complete(raw, observed, supported, grid)
-    # Inferred crops without sufficient learned-infiller anchors remain explicit.
-    return {
-        **completed,
-        "completion": fill,
-        "visible": supported.astype(np.float32),
-        "presence": supported.astype(np.float32),
-    }, raw
-
-
-def geometry_arrays(backend, prediction):
-    import torch
-
-    n = prediction["trans"].shape[1]
-    joints = np.full((2, n, 21, 3), np.nan, np.float32)
-    vertices = np.full((2, n, 778, 3), np.nan, np.float32)
-    for side in range(2):
-        good = np.isfinite(prediction["trans"][side]).all(-1)
-        ids = np.flatnonzero(good)
-        for a in range(0, len(ids), 128):
-            idx = ids[a : a + 128]
-            args = [
-                torch.as_tensor(
-                    prediction[k][side, idx], dtype=torch.float32, device="cuda"
-                )
-                for k in ("rotmat", "betas", "trans")
-            ]
-            with torch.no_grad():
-                j, v = backend.geometry(*args, side)
-            joints[side, idx], vertices[side, idx] = j.cpu().numpy(), v.cpu().numpy()
-    return joints, vertices
-
-
 def export(
     episode,
     output,
@@ -186,7 +143,7 @@ def export(
     no_preview=False,
 ):
     n = len(rows)
-    contract = rotation_contract(capture_contract(), meta.get("representation", "MANO"))
+    contract = rotation_contract(capture_contract(), meta["representation"])
     meta.update(
         epose_export=contract,
         pose_convention="T_C_W: bind-wrist axes to head optical camera; origin=joint 0; joint-orient conversion in epose_export; +X right +Y down +Z forward; meters; quaternion xyzw",
@@ -238,21 +195,17 @@ def export(
             & (joints[side, :, :, 2] > 0.01).all(-1)
             & (joints[side, :, :, 2] < 3.0).all(-1)
         )
-        # ACE consumes full RGB clips and predicts presence itself; detector
-        # misses must not suppress its independent occlusion predictions.
-        support = np.ones(n, bool) if meta["backend"] == "ace" else supported[side]
-        valid[side] = geometry & support & (prediction["presence"][side] > 0.5)
+        valid[side] = geometry & supported[side] & (prediction["presence"][side] > 0.5)
     wrist_rotations = camera_wrist_rotations(
-        prediction["rotmat"][:, :, 0], meta.get("representation", "MANO")
+        prediction["rotmat"][:, :, 0], meta["representation"]
     )
     values, pinch_distances, transforms = wrist_values(
         joints, wrist_rotations, valid, contract["gripper_max_m"]
     )
-    representation = meta.get("representation", "MANO")
     faces_left = faces[0] if isinstance(faces, dict) else faces[:, [0, 2, 1]]
     faces_right = faces[1] if isinstance(faces, dict) else faces
     save_npz(
-        output / ("soma.npz" if representation == "SOMA" else "mano.npz"),
+        output / "soma.npz",
         {
             **prediction,
             "joints_camera_m": joints,
@@ -267,13 +220,9 @@ def export(
             "camera_matrix": matrix,
             "sides": np.array(["left", "right"]),
             "axis_order": np.array("side,frame,..."),
-            "local_rotation_convention": np.array(
-                "native SOMA poses"
-                if representation == "SOMA"
-                else "absolute local rotations; mean already included"
-            ),
+            "local_rotation_convention": np.array("native SOMA poses"),
             "left_template": np.array(
-                meta.get("left_template", "mathematically reflected MANO_RIGHT")
+                meta.get("left_template", "native SOMAHand left/right rig")
             ),
         },
     )
@@ -350,16 +299,9 @@ def export(
                         cv2.LINE_AA,
                     )
                 for side, name in enumerate(("left", "right")):
-                    image_source = (
-                        "image_single_frame"
-                        if meta["backend"] == "wilor"
-                        else "image_temporal"
-                    )
                     source = (
-                        image_source
+                        "image_temporal"
                         if observed[side, i]
-                        else "learned_completion"
-                        if prediction["completion"][side, i]
                         else "tracked_crop"
                         if supported[side, i]
                         else "unsupported"
