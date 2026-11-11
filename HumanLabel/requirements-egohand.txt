@@ -11,4 +11,7 @@ einops==0.8.1
 cholespy==2.2.0
 rtree==1.4.1
 huggingface-hub==0.36.2
-ultralytics==8.3.203
+# Official headless distribution; exposes the same ultralytics Python module.
+ultralytics-opencv-headless==8.3.242
+# Required to deserialize the pinned hand detector checkpoint.
+dill==0.4.0

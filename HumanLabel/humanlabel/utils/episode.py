@@ -64,6 +64,8 @@ def detections(episode, rows, size, detector_path, cache):
     import torch
 
     os.environ["YOLO_CONFIG_DIR"] = str(cache.parent.parent / "yolo")
+    # Runtime inference must use the prepared environment, without pip installs.
+    os.environ["YOLO_AUTOINSTALL"] = "false"
     from ultralytics import YOLO
 
     torch.set_num_threads(8)

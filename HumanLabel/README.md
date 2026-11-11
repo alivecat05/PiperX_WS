@@ -39,14 +39,8 @@ cd PiperX_WS/HumanLabel
 
 按顺序完成本节的全部安装、第 2.3 节的模型资源准备，最后在第 2.4 节统一校验。
 
-先安装 OpenCV 系统运行库。Ubuntu / Debian 上执行（需要管理员权限；root 用户去掉 `sudo`）：
-
-```bash
-sudo apt-get update
-sudo apt-get install -y libgl1 libglib2.0-0
-```
-
-缺少 `libgl1` 时，`import cv2` 会报 `libGL.so.1` 找不到。无管理员权限时，由服务器或容器维护者预装这些库。
+本项目使用 `opencv-python-headless` 和检测器的官方 `ultralytics-opencv-headless` 发行版，适用于没有桌面的服务器。
+安装不需要 root，也不需要安装 OpenCV 的 `libGL` / Qt 图形界面运行库；视频读写和预览 MP4 导出仍然可用。
 
 每位使用者都需要创建自己的环境，仓库不包含开发者的虚拟环境。
 推荐使用 Conda；以下命令从新建环境开始，**不要直接在 `(base)` 中安装**：
@@ -68,7 +62,8 @@ python -m pip install -r requirements.txt -r requirements-egohand.txt
 如果已经自行创建并安装过这个 Conda 环境，后续只需 `conda activate humanlabel`。
 不同 GPU / 驱动需要选择兼容的 PyTorch CUDA 构建。
 
-`requirements.txt` 已固定普通版 `opencv-python`，上述安装命令会一并安装。
+两个 requirements 已固定 headless 依赖，上述命令会统一安装。检测器的 Python 导入仍是 `from ultralytics import YOLO`。
+参见 [OpenCV headless 安装说明](https://pypi.org/project/opencv-python-headless/4.11.0.86/)和 [Ultralytics headless 发行版](https://pypi.org/project/ultralytics-opencv-headless/8.3.242/)。
 
 <details>
 <summary>不用 Conda：从零创建 venv（二选一）</summary>
