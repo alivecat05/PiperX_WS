@@ -1,5 +1,7 @@
 # PiperCapture
 
+[简体中文](README.md) | [English](README.en.md)
+
 **两组主从 PiperX 示教采集**，D555 + 双 D405，不需要 Quest。
 
 当前接线是两路 USB-CAN，各自在 CAN 侧分接一组主从，原有硬件跟随保持不变。
@@ -9,12 +11,13 @@
 ## 使用
 
 ```powershell
-cd D:\Piper_WS\PiperCapture
+cd D:\PiperX_WS\PiperCapture
+.\setup.cmd        # 首次安装本机环境和依赖
 .\run.cmd --mock    # 无硬件模拟
 .\run.cmd           # 实机采集
 ```
 
-当前电脑复用相邻 `PiperX_Teleop` 的 Conda 环境。新电脑先运行 `setup.cmd`，然后在 `config.json` 填相机序列号和左右 CAN 编号；`run.cmd discover` 查询相机。
+首次运行 `setup.cmd` 安装本机 Conda 环境和依赖，然后在 `config.json` 填相机序列号和左右 CAN 编号；`run.cmd discover` 查询相机。仓库不包含开发者的环境。启动脚本也支持复用已在本机安装的相邻 `PiperX_Teleop` Conda 环境。
 
 `run.cmd discover-arms` 只读枚举 USB-CAN 编号和适配器标识，不会让机械臂运动；当前两组主从检测到两路是正常的。
 

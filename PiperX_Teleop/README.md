@@ -1,5 +1,7 @@
 ﻿# PiperX 双臂遥操
 
+[简体中文](README.md) | [English](README.en.md)
+
 Windows · Meta Quest 3 · 官方 pyAgxArm · 头部 D555 + 双腕 D405
 
 ## 功能
@@ -14,8 +16,8 @@ Windows · Meta Quest 3 · 官方 pyAgxArm · 头部 D555 + 双腕 D405
 Windows 10/11 x64，联网；项目路径建议不含空格。
 
 ```powershell
-git clone https://github.com/alivecat05/PiperX_Teleop.git
-cd PiperX_Teleop
+git clone https://github.com/alivecat05/PiperX_WS.git
+cd PiperX_WS/PiperX_Teleop
 .\setup.cmd
 ```
 

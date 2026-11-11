@@ -1,5 +1,7 @@
 # HumanLabel
 
+[简体中文](README.md) | [English](README.en.md)
+
 将 head 视频标注为 **腕部在相机系下的 epose＋拇指/食指距离**。
 
 ## 1. 标注链路

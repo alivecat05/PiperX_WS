@@ -1,18 +1,21 @@
 # HumanCapture
 
+[简体中文](README.md) | [English](README.en.md)
+
 人类示范三相机 RGB 采集：两台 D405i 腕部相机和一台 D555 头部相机。独立运行，不需要 Quest、CAN 或机械臂 SDK。界面为白色主题，三路实时视频分别显示 FPS、相机帧号及时间戳来源；绿色带表示就绪未采集，红色带表示采集中。
 
 ## 启动
 
-在 PowerShell 中：
+首次运行需安装包含 Tk 的 Python 3.12，或先完成相邻 `PiperX_Teleop` 的环境安装。在 PowerShell 中进入本仓库的 `HumanCapture/`：
 
 ```powershell
 cd D:\PiperX_WS\HumanCapture
+.\setup.cmd
 .\capture.cmd discover
 .\capture.cmd
 ```
 
-当前工作区可直接复用旁边 PiperX_Teleop 的 Python 环境。也可先运行 `.\setup.cmd`，创建独立 `.venv` 并安装依赖；没有旁边的环境时，需要先安装包含 Tk 的 Python 3.12。
+`setup.cmd` 会创建本机独立的 `.venv` 并安装依赖；仓库不包含开发者的环境。后续启动只需运行 `.\capture.cmd`。如果已在本机安装相邻 PiperX_Teleop 的环境，启动脚本也支持直接复用。
 
 仓库已包含当前设备的 `config.json`，保留三台相机序列号、采集参数和已识别的踏板键（当前 F8）；迁移到新电脑继续使用同一套硬件时可直接沿用，setup 不覆盖已有配置。更换相机时更新 `cameras` 中的序列号。缺少配置时可复制 `config.example.json`（setup 会自动复制）。`discover` 列出 SDK 可见设备及实际 RGB 模式。配置示例为 DDS domain 0、D555 896×504@30、双腕 640×480@30；当前设备配置使用 D555 1280×800@30、双腕 1280×720@30。`model: D405` 可以匹配包含 D405 的设备型号。以实际枚举结果为准，不会静默换用低帧率模式。三台相机均开启后才允许录制。
 
@@ -79,7 +82,8 @@ GUI 预览、同步调度、相机采集及视频编码分别运行，预览缩�
 ## 验证
 
 ```powershell
-..\PiperX_Teleop\.conda\envs\teleop\python.exe -m pytest tests -q
+.\.venv\Scripts\python.exe -m pip install pytest
+.\.venv\Scripts\python.exe -m pytest tests -q
 ```
 
 测试使用合成时间戳和真实 MP4 编码，覆盖 30 Hz 连续匹配、不复用帧、时间差超限、无效时钟、任务序号与防覆盖、停止尾帧及相机丢失。不操作实际硬件。
