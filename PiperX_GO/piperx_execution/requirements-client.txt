@@ -1,0 +1,7 @@
+# CPU-only PC transport/control dependencies. SDK/cameras use PiperX_Teleop's environment.
+numpy>=1.23,<3
+scipy>=1.9,<2
+opencv-python>=4.10,<5
+websockets==13.1
+msgpack>=1.0,<2
+av==12.3.0
