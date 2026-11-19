@@ -55,9 +55,13 @@ class Cameras:
         delay = cfg["sync"]["delay_ms"]/1000
         self.histories = {name: History(max(12, math.ceil((delay+.5)*cfg["cameras"][name]["fps"])))
                           for name in CAMERAS}
+        # Host arrival rate must remain observable even if SDK timestamps fail.
+        self.received = {name: History(120) for name in CAMERAS}
         self.errors = {}
         self.diagnostics = {n: dict(received_frames=0, source_gaps=0, timeouts=0,
-                                    reconnects=0, timestamp_rejections=0, max_receive_gap_ms=0.)
+                                    reconnects=0, timestamp_rejections=0, timestamp_regressions=0,
+                                    max_receive_gap_ms=0., sdk_queue_depth=0, sdk_queue_peak=0,
+                                    processing_ms=0., max_processing_ms=0.)
                             for n in CAMERAS}
         self.sequences = dict.fromkeys(CAMERAS, 0)
         self.exposure_settings = {}
@@ -89,10 +93,23 @@ class Cameras:
                 if self.stop_event.wait(1.):
                     return
 
+    def _note_received(self, name, receive, number):
+        stats = self.diagnostics[name]
+        previous = self.received[name].latest()
+        stats["received_frames"] += 1
+        if previous is not None:
+            stats["source_gaps"] += max(0, number-previous.value-1)
+            stats["max_receive_gap_ms"] = round(max(stats["max_receive_gap_ms"],
+                                                      (receive-previous.t)*1000), 1)
+        self.received[name].add(receive, number)
+
     def _stream(self, name):
         pipe = None
         try:
             cfg = self.cfg["cameras"][name]
+            # Device counters can restart at an unrelated number on reconnect.
+            # Compare numbers within this connection, preserving cumulative gaps.
+            self.received[name] = History(120)
             if self.mock:
                 index = 0
                 deadline = time.perf_counter()
@@ -101,6 +118,7 @@ class Cameras:
                     image = np.zeros((cfg["height"], cfg["width"], 3), np.uint8)
                     cv2.putText(image, f"MOCK {name} {index}", (20, 80), cv2.FONT_HERSHEY_SIMPLEX,
                                 .8, (40, 210, 110), 2)
+                    self._note_received(name, t, index)
                     self.histories[name].add(t, {"bgr": image, "frame_number": index,
                                                 "device_ms": t * 1000, "clock": "mock",
                                                 "timestamp_basis": "host_monotonic", "receive_s": t})
@@ -114,7 +132,16 @@ class Cameras:
             pipe = rs.pipeline(self.context)
             rs_cfg = rs.config()
             prepare_rgb(rs_cfg, rs, cfg)
-            profile = pipe.start(rs_cfg)  # Fail clearly if the selected profile isn't supported.
+            # The pipeline's default wait_for_frames queue holds only the latest
+            # frameset. Buffer in the SDK (without a Python/GIL callback) so short
+            # scheduling stalls do not discard every intermediate frame. Keep SDK
+            # buffers alive only until the image is copied into our own history.
+            capacity = max(4, min(16, math.ceil(self.cfg["sync"]["delay_ms"]*cfg["fps"]/1000)+2))
+            frame_queue = rs.frame_queue(capacity, keep_frames=True)
+            # The keyword selects the native queue overload, rather than the
+            # earlier Python-callable overload (frame_queue is also callable).
+            profile = pipe.start(rs_cfg, queue=frame_queue)
+            self.diagnostics[name]["sdk_queue_capacity"] = capacity
             actual = profile.get_device().get_info(rs.camera_info.name)
             if cfg["model"] not in actual:
                 raise ValueError(f"{name}: expected {cfg['model']}, found {actual}")
@@ -129,18 +156,19 @@ class Cameras:
                     sensor.set_option(rs.option.enable_auto_exposure, 1)
             warmup_until = time.perf_counter()+2
             wall_offset = time.perf_counter() - time.time()
-            previous_number = previous_receive = None
             consecutive_timeouts = 0
             while not self.stop_event.is_set():
-                arrived, frames = pipe.try_wait_for_frames(500)
+                arrived, queued_frame = frame_queue.try_wait_for_frame(500)
                 if not arrived:
                     self.diagnostics[name]["timeouts"] += 1
+                    self.diagnostics[name]["sdk_queue_depth"] = 0
                     consecutive_timeouts += 1
                     self.errors[name] = "等待相机帧，采集将自动恢复"
                     if consecutive_timeouts >= 4:
                         raise RuntimeError("No camera frames for 2 seconds")
                     continue
                 consecutive_timeouts = 0
+                frames = queued_frame.as_frameset()
                 frame = frames.get_color_frame()
                 if not frame:
                     continue
@@ -153,12 +181,9 @@ class Cameras:
                                                      name, self.exposure_settings[name])
                 number = frame.get_frame_number()
                 stats = self.diagnostics[name]
-                stats["received_frames"] += 1
-                if previous_number is not None:
-                    stats["source_gaps"] += max(0, number-previous_number-1)
-                    stats["max_receive_gap_ms"] = round(max(stats["max_receive_gap_ms"],
-                                                            (receive-previous_receive)*1000), 1)
-                previous_number, previous_receive = number, receive
+                self._note_received(name, receive, number)
+                stats["sdk_queue_depth"] = frame_queue.size()
+                stats["sdk_queue_peak"] = max(stats["sdk_queue_peak"], stats["sdk_queue_depth"])
                 domain = frame.get_frame_timestamp_domain()
                 device_ms = frame.get_timestamp()
                 try:
@@ -168,11 +193,17 @@ class Cameras:
                     self.errors[name] = str(error)
                     continue
                 self.sequences[name] += 1  # Hardware frame numbers may reset after reconnecting.
-                self.histories[name].add(stamp, {"bgr": np.asanyarray(frame.get_data()).copy(),
+                accepted = self.histories[name].add(stamp, {"bgr": np.asanyarray(frame.get_data()).copy(),
                     "frame_number": number, "sequence": self.sequences[name], "device_ms": device_ms,
                     "exposure_locked": True, "depth_enabled": False,
                     "exposure_settings": self.exposure_settings[name],
                     "clock": str(domain), "timestamp_basis": basis, "receive_s": receive})
+                stats["processing_ms"] = round((time.perf_counter()-receive)*1000, 2)
+                stats["max_processing_ms"] = max(stats["max_processing_ms"], stats["processing_ms"])
+                if not accepted:
+                    stats["timestamp_regressions"] += 1
+                    self.errors[name] = "相机时间戳未递增，帧已拒绝；详情见诊断日志"
+                    continue
                 self.errors.pop(name, None)
         finally:
             if pipe is not None:

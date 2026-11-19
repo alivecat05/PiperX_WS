@@ -7,6 +7,8 @@ from pathlib import Path
 import sys
 import time
 
+import cv2
+
 from .cameras import Cameras, discover
 from .controller import Controller
 from .core import CAMERAS
@@ -59,9 +61,14 @@ def main():
     parser.add_argument("--config", default=str(ROOT/"config.json"))
     parser.add_argument("--mock", action="store_true", help="Use synthetic cameras; no hardware access")
     parser.add_argument("--smoke-seconds", type=float, help="Headless mock recording check; requires --mock")
+    parser.add_argument("--diagnose-seconds", type=float, help="Monitor cameras without preview or recording")
     args = parser.parse_args()
     if args.smoke_seconds is not None and (not args.mock or not 0 < args.smoke_seconds <= 60):
         parser.error("--smoke-seconds requires --mock and a duration in (0, 60]")
+    if args.diagnose_seconds is not None and not 0 < args.diagnose_seconds <= 3600:
+        parser.error("--diagnose-seconds requires a duration in (0, 3600]")
+    if args.diagnose_seconds is not None and args.smoke_seconds is not None:
+        parser.error("--diagnose-seconds cannot be combined with --smoke-seconds")
     cameras = control = view = None
     try:
         cfg = load_config(args.config)
@@ -72,10 +79,22 @@ def main():
         log.parent.mkdir(parents=True, exist_ok=True)
         logging.basicConfig(filename=log, encoding="utf-8", level=logging.INFO,
                             format="%(asctime)s %(levelname)s %(message)s", force=True)
+        # Camera workers, Tk and the writer already run concurrently. Avoid an
+        # additional core-sized OpenCV pool competing with time-sensitive reads.
+        cv2.setNumThreads(1)
+        logging.info("Capture runtime: OpenCV=%s threads=%s mock=%s config=%s",
+                     cv2.__version__, cv2.getNumThreads(), args.mock, args.config)
         cameras = Cameras(cfg, args.mock)
         cameras.start()
         control = Controller(cfg, cameras, args.mock)
         control.start()
+        if args.diagnose_seconds is not None:
+            deadline = time.perf_counter()+args.diagnose_seconds
+            while time.perf_counter() < deadline:
+                time.sleep(min(.1, max(0, deadline-time.perf_counter())))
+            status = control.status()
+            print(json.dumps(status, ensure_ascii=False, indent=2))
+            return 0 if status["ready"] else 1
         if args.smoke_seconds is not None:
             deadline = time.perf_counter()+5
             while not control.status()["ready"] and time.perf_counter() < deadline:

@@ -1,5 +1,7 @@
 """Acquisition runs independently of Tk rendering and MP4 encoding."""
 import copy
+import json
+import logging
 from queue import Empty, Queue
 from threading import Event, Lock, Thread
 import time
@@ -23,6 +25,7 @@ class Controller:
         self.end_time = None
         self.message = "等待三路相机就绪"
         self.last_result = None
+        self.last_diagnostic_time = None
         self._publish(time.perf_counter())
 
     def request(self, operation, **arguments):
@@ -36,8 +39,10 @@ class Controller:
         problems = []
         for n in CAMERAS:
             frame = self.cameras.histories[n].latest()
-            if n in self.cameras.errors:
-                problems.append(f"{n}：{self.cameras.errors[n]}")
+            # A camera worker clears its error as soon as frames resume.
+            camera_error = self.cameras.errors.get(n)
+            if camera_error:
+                problems.append(f"{n}：{camera_error}")
             elif frame is None or now-frame.value["receive_s"] > self.cfg["camera_timeout_s"]:
                 problems.append(f"等待 / 丢失相机：{n}")
             elif self.cfg["sync"]["require_sdk_timestamps"] and frame.value["timestamp_basis"] == "host_receive":
@@ -88,7 +93,7 @@ class Controller:
                 if operation in ("capture_settings", "next_index", "record_start"):
                     self.capture.error = self.message
 
-    def tick(self, now):
+    def tick(self, now, *, publish=True):
         self._commands(now)
         if self.recording:
             # A late/missing camera is a gap in the dataset, not a stop command.
@@ -114,7 +119,9 @@ class Controller:
                     self.recording = False
         self._check_result()
         self.capture.refresh()
-        self._publish(now)
+        if publish:
+            self._publish(now)
+            self._log_diagnostics(now)
 
     def _check_result(self):
         if self.recorder.result is not None and self.recorder.result != self.last_result:
@@ -139,10 +146,13 @@ class Controller:
                  "write_fps": self.recorder.writes.fps(now), "result": self.recorder.result,
                  "writer_queue": self.recorder.queue.qsize() if hasattr(self.recorder, "queue") else 0,
                  "writer_queue_capacity": self.recorder.queue.maxsize if hasattr(self.recorder, "queue") else 0,
+                 "mean_encode_ms": getattr(self.recorder, "encode_total_s", 0.)/max(1, self.recorder.count)*1000,
+                 "max_encode_ms": getattr(self.recorder, "max_encode_s", 0.)*1000,
                  "path": str(self.recorder.path or ""), "cameras": {}}
         for n in CAMERAS:
             frame = self.cameras.histories[n].latest()
             state["cameras"][n] = {"fps": self.cameras.histories[n].fps(now),
+                "receive_fps": self.cameras.received[n].fps(now) if hasattr(self.cameras, "received") else None,
                 "frame_number": frame.value["frame_number"] if frame else None,
                 "clock": frame.value["timestamp_basis"] if frame else "等待相机",
                 "receive_age_ms": round(max(0, now-frame.value["receive_s"])*1000, 1) if frame else None,
@@ -157,10 +167,27 @@ class Controller:
         with self.lock:
             return copy.deepcopy(self.snapshot)
 
+    def _log_diagnostics(self, now):
+        if self.last_diagnostic_time is not None and now-self.last_diagnostic_time < 2:
+            return
+        self.last_diagnostic_time = now
+        state = self.status()
+        report = {k: state[k] for k in ("recording", "saving", "valid_frames", "placeholder_frames",
+                  "dropped", "drop_reasons", "writer_queue", "writer_queue_capacity",
+                  "mean_encode_ms", "max_encode_ms", "cameras")}
+        logging.getLogger(__name__).info("Capture diagnostics: %s", json.dumps(report, ensure_ascii=False))
+
     def _run(self):
+        next_publish = 0.
         while not self.stop_event.is_set():
             try:
-                self.tick(time.perf_counter())
+                now = time.perf_counter()
+                # Poll commands and the sync grid promptly. Computing UI rates
+                # or copying diagnostics faster than the cameras adds CPU load.
+                publish = now >= next_publish
+                self.tick(now, publish=publish)
+                if publish:
+                    next_publish = now + 1 / self.cfg["record_hz"]
             except Exception as error:
                 self.message = f"采集错误：{type(error).__name__}: {error}"
                 self.recording = False

@@ -79,6 +79,10 @@ GUI preview, synchronization, camera acquisition, and video encoding run separat
 
 To investigate gaps, inspect `manifest.json`. Under `camera_diagnostics`, `source_gaps` reports SDK frame-number gaps, `max_receive_gap_ms` the peak receive interval, and `arrival_delay_ms` recent transmission/clock-mapped arrival delay. `timeouts/reconnects/timestamp_rejections` distinguish outages from clock problems. `writer_diagnostics` records encoding times and peak queue usage; `drop_reasons.writer_queue_full` indicates an encoding or disk backlog. Complete source frames with synchronization gaps can reflect source timestamp spans or arrival delays; not every synchronization gap is USB packet loss.
 
+If all three cameras slow down, run `.\capture.cmd --diagnose-seconds 300` on the capture machine. It reads the configured cameras for five minutes with preview and encoding disabled. Both this command and regular capture write a `Capture diagnostics` entry to `outputs/logs/capture.log` every two seconds.
+
+Compare `receive_fps` (color frames dequeued on the host) with `fps` (frames in the synchronization history, measured on their source timestamps). Check for increasing `timestamp_rejections` and `timestamp_regressions` if the rates diverge. `sdk_queue_depth` counts frames still waiting after a read and `sdk_queue_peak` is the highest observed remaining depth. The current configuration buffers six frames per camera. Check SDK frame-number gaps, sync rejections, and writer queue drops alongside these counts. Preview refreshes about every 67 ms while capture and recording run at 30 Hz.
+
 ## Verification
 
 ```powershell

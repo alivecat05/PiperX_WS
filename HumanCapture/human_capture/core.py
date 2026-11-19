@@ -22,6 +22,8 @@ class History:
         with self.lock:
             if not self.items or t > self.items[-1].t:
                 self.items.append(Sample(t, value))
+                return True
+            return False
 
     def snapshot(self):
         with self.lock:

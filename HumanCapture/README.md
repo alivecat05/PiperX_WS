@@ -79,6 +79,12 @@ GUI 预览、同步调度、相机采集及视频编码分别运行，预览缩�
 
 排查缺帧时查看 `manifest.json`：`camera_diagnostics` 中的 `source_gaps` 表示 SDK 帧号缺口，`max_receive_gap_ms` 表示接收间隔峰值，`arrival_delay_ms` 表示最近帧传输/时钟映射后的到达延迟，`timeouts/reconnects/timestamp_rejections` 区分断流和时钟异常。`writer_diagnostics` 保存编码耗时及队列峰值；`drop_reasons.writer_queue_full` 表示编码或写盘积压。源帧完整而同步缺帧可能与来源时间跨度或到达延迟有关，不能把所有同步缺口都归因于 USB 丢包。
 
+三路同时掉帧时，可在采集电脑上运行 `.\capture.cmd --diagnose-seconds 300`。它按当前配置打开三台相机，持续取帧 5 分钟，关闭预览和视频编码。正常采集和此诊断模式都会每 2 秒在 `outputs/logs/capture.log` 中写入一条 `Capture diagnostics`。可按时间比较故障前后的几条记录。
+
+- `receive_fps` 按应用从 SDK 队列取出彩色帧的时间计算。`fps` 按进入同步缓存的有效时间戳计算。两者出现明显差异时，检查 `timestamp_rejections` 和 `timestamp_regressions` 是否在增加。
+- `sdk_queue_depth` 表示取出一帧时还在 SDK 队列中等待的帧数，`sdk_queue_peak` 是这一数值的历史峰值。当前配置每路可缓冲 6 帧。持续积压时再对照 `source_gaps` 和 `drop_reasons`，区分帧号跳变、同步缺口和写盘队列满。
+- 界面预览约每 67 ms 刷新一次。相机和录制使用 30 Hz，因此判断数据质量应看有效同步帧和占位帧数。
+
 ## 验证
 
 ```powershell

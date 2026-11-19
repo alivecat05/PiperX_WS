@@ -155,15 +155,17 @@ def test_camera_stream_locks_only_after_warmup_and_restores_on_reconnect(cfg, mo
                 get_data=lambda: np.zeros((48, 64, 3), np.uint8))
             if index[0] >= 5:
                 camera.stop_event.set()
-            return True, NS(get_color_frame=lambda: frame)
-        pipe = NS(start=lambda _: stream_profile, stop=lambda: None,
-                  try_wait_for_frames=next_frame)
+            frameset = NS(get_color_frame=lambda: frame)
+            return True, NS(as_frameset=lambda: frameset)
+        pipe = NS(start=lambda config, *, queue: stream_profile, stop=lambda: None)
+        sdk_queue = NS(try_wait_for_frame=next_frame, size=lambda: 0)
         config = NS(disable_all_streams=lambda: config_calls.append("disable_all"),
                     enable_device=lambda _: None,
                     enable_stream=lambda stream, *args: config_calls.append(stream))
         fake_rs = NS(stream=RS.stream, format=RS.format,
             option=NS(**vars(RS.option), global_time_enabled="global"),
-            camera_info=NS(name="name"), pipeline=lambda _: pipe, config=lambda: config)
+            camera_info=NS(name="name"), pipeline=lambda _: pipe, config=lambda: config,
+            frame_queue=lambda capacity, keep_frames: sdk_queue)
         monkeypatch.setitem(sys.modules, "pyrealsense2", fake_rs)
         monkeypatch.setattr(module, "time", NS(perf_counter=lambda: clock[0], time=lambda: clock[0]))
         camera.stop_event.clear()

@@ -217,6 +217,7 @@ class Preview:
             clock = {"global_time": "SDK 全局时钟", "system_time": "SDK 系统时钟",
                      "host_monotonic": "模拟时钟", "host_receive": "未同步，不能录制"}.get(camera["clock"], camera["clock"])
             self.labels[name].configure(text=f"{LABELS[name]}   {camera['fps']:.1f} FPS   帧 {camera['frame_number']}\n{clock}"
+                +(f" · 接收 {camera['receive_fps']:.1f} FPS" if camera.get('receive_fps') is not None else "")
                 +f" · 接收延迟 {camera.get('arrival_delay_ms')} ms · 源缺帧 {camera.get('source_gaps', 0)}"
                 +("\nRGB · 曝光/增益已锁定："+str(camera['exposure_settings']) if camera.get('exposure_settings') else ""))
         self.detail.configure(text="30 Hz 时间轴 · 掉帧继续录制并保持上帧，缺帧位置明确标记 · 视频时长与采集时长一致\n"
@@ -242,7 +243,9 @@ class Preview:
             self.photos[name] = tk.PhotoImage(master=self.root, data=f"P6\n{w} {h}\n255\n".encode()+rgb.tobytes(), format="PPM")
             widget.configure(image=self.photos[name], text="")
             self.last_frames[name] = key
-        self.root.after(33, self.refresh)
+        # Rendering three Tk images competes for the GIL with SDK consumers.
+        # Preview at up to 15 Hz; acquisition and saved videos remain 30 Hz.
+        self.root.after(66, self.refresh)
 
     def close(self):
         self.closing = True
