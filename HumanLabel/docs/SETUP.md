@@ -2,7 +2,7 @@
 
 ## 当前方案：EgoHand
 
-先完成 [README 的从零安装](../README.md#从零安装)，创建并激活你自己的 Conda 或 venv 环境，安装 Python 依赖。
+先完成 [README 的环境配置](../README.md#环境配置)，创建并激活你自己的 Conda 或 venv 环境，安装 Python 依赖。
 以下命令均在克隆所得的 `HumanLabel/` 目录及该环境中执行，不依赖开发者机器上的环境或缓存。
 本流程使用独立的手部检测器；不需要额外安装 RT-DETR、MediaPipe 或完整 IsaacCapture 工具链。
 
