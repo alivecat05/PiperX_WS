@@ -9,6 +9,14 @@ COMMANDS = {
         "humanlabel.workflows.pipeline",
         "EgoHand + native smoothing + context recovery + camera epose export",
     ),
+    "label-parallel": (
+        "humanlabel.workflows.parallel_pipeline",
+        "Label episodes in place with persistent workers across visible GPUs",
+    ),
+    "replay-piperx": (
+        "humanlabel.workflows.piperx_replay",
+        "Replay and verify dual-arm Piper X actions in MuJoCo",
+    ),
     "export": (
         "humanlabel.export",
         "Re-export existing geometry as PiperCapture-format camera wrist eposes",

@@ -12,16 +12,18 @@ def test_export_preserves_capture_gaps_and_uses_each_frames_camera(tmp_path):
     from humanlabel.utils.episode import export
     from humanlabel.validation import validate
 
-    n = 4
+    n = 7
     rows = [
         {
             "frame_index": str(i),
             "grid_index": str(g),
             "timestamp_unix_s": str(100 + g / 30),
             "head_timestamp_unix_s": str(100 + g / 30),
+            "sample_valid": str(i != 2),
         }
-        for i, g in enumerate([0, 1, 5, 6])
+        for i, g in enumerate([0, 1, 2, 3, 4, 7, 8])
     ]
+    rows[2]["head_timestamp_unix_s"] = rows[1]["head_timestamp_unix_s"]
     matrices = np.tile(
         np.array([[100.0, 0, 320], [0, 100.0, 240], [0, 0, 1.0]]), (n, 1, 1)
     )
@@ -79,10 +81,13 @@ def test_export_preserves_capture_gaps_and_uses_each_frames_camera(tmp_path):
     assert float(q[1]["left.wrist_u_px"]) == pytest.approx(340.0)
     assert q[0]["left.pose_valid"] == q[0]["left.pinch_valid"] == "1"
     assert q[0]["left.source"] == "image_temporal"
+    assert q[2]["left.valid"] == q[2]["left.detected"] == "0"
+    assert q[2]["left.source"] == "capture_placeholder"
     mapping = list(csv.DictReader((tmp_path / "frame_map.csv").open()))
-    assert [m["segment_id"] for m in mapping] == ["0", "0", "1", "1"]
+    assert [m["frame_index"] for m in mapping] == ["0", "1", "3", "4", "5", "6"]
+    assert [m["segment_id"] for m in mapping] == ["0", "0", "1", "1", "2", "2"]
     assert (tmp_path / "soma.npz").exists()
     report = validate(tmp_path)
     assert report["preview_decoded_frames"] == n
     assert report["epose_contract"]["camera_wrist_transform_verified"]
-    assert report["motion_statistics"]["left"]["consecutive_pairs"] == 2
+    assert report["motion_statistics"]["left"]["consecutive_pairs"] == 3

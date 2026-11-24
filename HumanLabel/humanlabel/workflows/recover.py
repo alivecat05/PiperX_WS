@@ -7,16 +7,16 @@ Native predictions and extracted frames come from the run's temporary directory.
 
 import argparse
 import json
-import sys
 import time
 from pathlib import Path
 
 import cv2
 import numpy as np
 
+from humanlabel.utils.camera import captured_frames, perspective_calibration
 from humanlabel.utils.episode import export, read_episode, save_npz
-from humanlabel.utils.paths import MODEL
 from humanlabel.utils.tracking import contiguous_ranges, track_boxes
+from humanlabel.workflows.egohand import configure_upstream, load_predictor
 
 
 def crop_candidates(
@@ -44,36 +44,31 @@ def crop_candidates(
     return boxes, supported, added
 
 
-def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--source", type=Path, required=True)
-    p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--episodes", nargs="+", help="Process only these episode names")
-    args = p.parse_args(argv)
+def run(source_dir, output_dir, episode_names=None, *, predictor=None):
     import torch
 
-    sys.path[:0] = [
-        str(MODEL / "IsaacCapture/src/python/isaaccapture_egopost"),
-        str(MODEL / "dinov3"),
-    ]
-    torch.set_num_threads(8)
+    configure_upstream()
+    if predictor is None:
+        torch.set_num_threads(8)
     from inference.camera.camera_models import load_camera_calibration
-    from inference.pipeline.predictor import EgoHandPredictor
 
-    predictor = None
     summaries = []
-    for folder in sorted(args.source.glob("episode_*")):
-        if args.episodes and folder.name not in args.episodes:
+    for folder in sorted(source_dir.glob("episode_*")):
+        if episode_names and folder.name not in episode_names:
             continue
-        output = args.output / folder.name
-        if (output / "manifest.json").exists() and json.loads(
-            (output / "manifest.json").read_text()
-        ).get("status") == "complete":
-            summaries.append(json.loads((output / "manifest.json").read_text()))
-            continue
+        output = output_dir / folder.name
         started = time.monotonic()
         meta = json.loads((folder / "manifest.json").read_text())
         assert meta["status"] == "complete" and meta["representation"] == "SOMA"
+        intrinsics = meta.get("camera_calibration")
+        manifest_path = output / "manifest.json"
+        previous = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+        if (
+            previous.get("status") == "complete"
+            and previous.get("camera_calibration") == intrinsics
+        ):
+            summaries.append(previous)
+            continue
         meta.update(
             status="processing",
             processing_chain=["EgoHand", "native smoothing", "context crops", "epose"],
@@ -87,15 +82,19 @@ def main(argv=None):
         )
         episode = Path(meta["source"])
         _, rows, size, fps, n = read_episode(episode)
+        captured = captured_frames(rows)
         if not (folder / "tracking.npz").exists():
             cached = json.loads(
                 (
-                    args.source.parent / "frames" / folder.name / "detections.json"
+                    source_dir.parent / "frames" / folder.name / "detections.json"
                 ).read_text()
             )["detections"]
             grid = np.array([int(r["grid_index"]) for r in rows])
             values = track_boxes(
-                [np.asarray(d, np.float32).reshape(-1, 6) for d in cached], grid, 90
+                [np.asarray(d, np.float32).reshape(-1, 6) for d in cached],
+                grid,
+                90,
+                captured=captured,
             )
             save_npz(
                 folder / "tracking.npz",
@@ -116,6 +115,8 @@ def main(argv=None):
             tracking["grid"],
             fps,
         )
+        supported &= captured
+        added &= captured
         with np.load(folder / "soma.npz") as d:
             if not np.array_equal(d["detected"], tracking["observed"]):
                 raise ValueError("Source detector association changed")
@@ -138,28 +139,14 @@ def main(argv=None):
             )
             faces = {0: d["faces_left"], 1: d["faces_right"]}
         matrix = np.asarray(meta["camera_matrix"])
+        source_camera = load_camera_calibration(intrinsics) if intrinsics is not None else None
         output.mkdir(parents=True, exist_ok=True)
         try:
             if added.any():
                 if predictor is None:
-                    predictor = EgoHandPredictor.from_checkpoint(
-                        MODEL / "egohand/egohand_s060000.ckpt",
-                        MODEL / "egohand/soma",
-                        batch_size=4,
-                        device="cuda",
-                        dtype=torch.bfloat16,
-                        smooth=True,
-                        use_perspective_cropping=True,
-                    )
-                    predictor.model.eval().requires_grad_(False)
-                camera = load_camera_calibration(
-                    {
-                        "model": "PINHOLE",
-                        "image_width": size[0],
-                        "image_height": size[1],
-                        "camera_matrix": {"matrix_3x3": matrix.tolist()},
-                        "distortion_coefficients": [],
-                    }
+                    predictor = load_predictor()
+                camera = source_camera or load_camera_calibration(
+                    perspective_calibration(size, matrix)
                 )
                 indices = np.flatnonzero(added.any(0))
                 ids = [str(i) for i in indices]
@@ -177,7 +164,7 @@ def main(argv=None):
                 images = [
                     cv2.imread(
                         str(
-                            args.source.parent / "frames" / folder.name / f"{i:06d}.jpg"
+                            source_dir.parent / "frames" / folder.name / f"{i:06d}.jpg"
                         )
                     )
                     for i in indices
@@ -194,7 +181,7 @@ def main(argv=None):
                     frame_times=times,
                     defer_smoothing=True,
                 )
-                for a, b in contiguous_ranges(tracking["grid"]):
+                for a, b in contiguous_ranges(tracking["grid"], captured):
                     keys = [str(i) for i in indices if a <= i < b]
                     if not keys:
                         continue
@@ -253,6 +240,7 @@ def main(argv=None):
                 tracking["gap_length"],
                 matrix,
                 meta,
+                source_camera=source_camera,
             )
             meta.update(
                 status="complete",
@@ -271,9 +259,18 @@ def main(argv=None):
             (output / "manifest.json").write_text(
                 json.dumps(meta, ensure_ascii=False, indent=2)
             )
-    (args.output / "summary.json").write_text(
+    (output_dir / "summary.json").write_text(
         json.dumps(summaries, ensure_ascii=False, indent=2)
     )
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--episodes", nargs="+", help="Process only these episode names")
+    args = parser.parse_args(argv)
+    run(args.source, args.output, args.episodes)
 
 
 if __name__ == "__main__":

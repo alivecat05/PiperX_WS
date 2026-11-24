@@ -5,6 +5,7 @@ import csv
 import hashlib
 import json
 from functools import lru_cache
+from math import isfinite
 from pathlib import Path
 
 import numpy as np
@@ -135,6 +136,51 @@ def write_csv(path, header, rows):
         writer.writerow(header)
         writer.writerows(rows)
     temporary.replace(path)
+
+
+def read_action_rows(path):
+    with path.open(encoding="utf-8-sig", newline="") as stream:
+        reader = csv.reader(stream)
+        if next(reader, None) != HEADER:
+            raise ValueError(f"Unexpected action CSV header: {path}")
+        return list(reader)
+
+
+def frame_aligned_actions(rows, timestamps):
+    """Keep one finite, two-hand action per video frame in timestamp order."""
+    timeline = set(timestamps)
+    if not timeline or len(timeline) != len(timestamps):
+        raise ValueError("Video timestamps must be present and unique")
+
+    actions = {}
+    for row in rows:
+        if len(row) != len(HEADER):
+            raise ValueError("Unexpected action CSV row width")
+        stamp = row[0]
+        if stamp not in timeline or stamp in actions:
+            raise ValueError(f"Action timestamp is unknown or repeated: {stamp}")
+        actions[stamp] = row[1:]
+
+    hands = []
+    for side, name in enumerate(SIDES):
+        start = 8 * side
+        observed = {}
+        for stamp, action in actions.items():
+            pose = action[start : start + 8]
+            if all(value and isfinite(float(value)) for value in pose):
+                observed[stamp] = pose
+
+        previous = next((observed[t] for t in timestamps if t in observed), None)
+        if previous is None:
+            raise ValueError(f"No valid {name} hand pose to fill missing frames")
+
+        poses = []
+        for stamp in timestamps:
+            previous = observed.get(stamp, previous)
+            poses.append(previous)
+        hands.append(poses)
+
+    return [[stamp, *left, *right] for stamp, left, right in zip(timestamps, *hands)]
 
 
 def write_products(

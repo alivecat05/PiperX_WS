@@ -9,29 +9,28 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from humanlabel.utils.camera import camera_model
+from humanlabel.utils.camera import (
+    camera_model,
+    captured_frames,
+    check_intrinsics_size,
+    load_head_calibration,
+    perspective_calibration,
+)
 from humanlabel.utils.episode import detections, export, read_episode, save_npz
 from humanlabel.utils.paths import MODEL, ROOT
 from humanlabel.utils.tracking import contiguous_ranges, track_boxes
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "source", nargs="?", type=Path, default=ROOT / "human_demonstration"
-    )
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument(
-        "--episodes", nargs="+", help="Process only these episode names"
-    )
-    args = parser.parse_args(argv)
+def configure_upstream():
+    for path in (MODEL / "IsaacCapture/src/python/isaaccapture_egopost", MODEL / "dinov3"):
+        if str(path) not in sys.path:
+            sys.path.insert(0, str(path))
+
+
+def load_predictor():
     import torch
 
-    repo = MODEL / "IsaacCapture/src/python/isaaccapture_egopost"
-    sys.path.insert(0, str(repo))
-    sys.path.insert(0, str(MODEL / "dinov3"))
-    torch.set_num_threads(8)
-    from inference.camera.camera_models import load_camera_calibration
+    configure_upstream()
     from inference.pipeline.predictor import EgoHandPredictor
 
     predictor = EgoHandPredictor.from_checkpoint(
@@ -44,33 +43,69 @@ def main(argv=None):
         use_perspective_cropping=True,
     )
     predictor.model.eval().requires_grad_(False)
-    assets = np.load(MODEL / "egohand/soma/SOMAHand.npz", allow_pickle=True)
-    faces = {
-        0: assets["left_triangles"].astype(np.int32),
-        1: assets["right_triangles"].astype(np.int32),
-    }
+    return predictor
+
+
+def run(source_dir, output_dir, episode_names=None, *, predictor=None, detector=None, intrinsics=None):
+    import torch
+
+    configure_upstream()
+    from inference.camera.camera_models import load_camera_calibration
+
+    if predictor is None:
+        torch.set_num_threads(8)
+        predictor = load_predictor()
+    with np.load(MODEL / "egohand/soma/SOMAHand.npz", allow_pickle=True) as assets:
+        faces = {
+            0: assets["left_triangles"].astype(np.int32),
+            1: assets["right_triangles"].astype(np.int32),
+        }
+        vertices_count = len(assets["left_vert_ids"])
     identity_dim = int(predictor.model.soma_hand.num_shape_components)
     scale_dim = int(predictor.model.soma_hand.num_scale_params)
     # Native SOMA-25 has one extra metacarpal per non-thumb finger.
     # Preserve native geometry in the archive as well as this OpenPose-like view.
     order = [0, 1, 2, 3, 4, 6, 7, 8, 9, 11, 12, 13, 14, 16, 17, 18, 19, 21, 22, 23, 24]
     episodes = (
-        [args.source]
-        if (args.source / "head.mp4").exists()
-        else sorted(args.source.glob("episode_*/"))
+        [source_dir]
+        if (source_dir / "head.mp4").exists()
+        else sorted(source_dir.glob("episode_*/"))
     )
-    if args.episodes:
-        episodes = [episode for episode in episodes if episode.name in args.episodes]
+    if episode_names:
+        episodes = [episode for episode in episodes if episode.name in episode_names]
     summaries = []
     for episode in episodes:
-        output = args.output / episode.name
+        output = output_dir / episode.name
         mp = output / "manifest.json"
-        if mp.exists() and json.loads(mp.read_text()).get("status") == "complete":
-            summaries.append(json.loads(mp.read_text()))
+        previous = json.loads(mp.read_text()) if mp.exists() else {}
+        calibration_matches = previous.get("camera_calibration") == intrinsics
+        if previous.get("status") == "complete" and calibration_matches:
+            summaries.append(previous)
             continue
         started = time.monotonic()
         source, rows, size, fps, count = read_episode(episode)
+        captured = captured_frames(rows)
+        if intrinsics is None:
+            matrix, distortion, basis = camera_model(*size)
+            calibration = perspective_calibration(size, matrix, distortion)
+        else:
+            calibration_size = (intrinsics["image_width"], intrinsics["image_height"])
+            check_intrinsics_size(size, calibration_size)
+            config = source.get("config", {})
+            cameras = config.get("realsense", {}).get("cameras") or config.get("cameras", {})
+            recorded = cameras.get("head", {}).get("serial")
+            serial = intrinsics.get("serial")
+            if serial and recorded and serial != str(recorded):
+                raise ValueError(
+                    f"Head camera serial {recorded} differs from calibration {serial}"
+                )
+            matrix = np.asarray(intrinsics["camera_matrix"]["matrix_3x3"])
+            calibration, basis = intrinsics, "provided_opencv_pinhole"
+        camera = load_camera_calibration(calibration)
         output.mkdir(parents=True, exist_ok=True)
+        cache = output / "prediction_raw.npz"
+        if not calibration_matches:
+            cache.unlink(missing_ok=True)
         meta = {
             "schema": "human_label.camera_pseudo_action.v2",
             "backend": "NVIDIA EgoHand",
@@ -82,6 +117,9 @@ def main(argv=None):
             "source_dropped_grid_ticks": source.get("dropped_grid_ticks", 0),
             "fps": fps,
             "size": size,
+            "camera_matrix": matrix.tolist(),
+            "camera_calibration": intrinsics,
+            "intrinsics_basis": basis,
             "robot_base_calibrated": False,
             "camera_fixed": True,
             "left_template": "native SOMAHand left/right rig",
@@ -109,10 +147,13 @@ def main(argv=None):
                 rows,
                 size,
                 MODEL / "weights/external/detector.pt",
-                args.output.parent / "frames" / episode.name,
+                output_dir.parent / "frames" / episode.name,
+                detector=detector,
             )
             grid = np.array([int(r["grid_index"]) for r in rows])
-            boxes, scores, observed, supported, gap_length = track_boxes(ds, grid, 90)
+            boxes, scores, observed, supported, gap_length = track_boxes(
+                ds, grid, 90, captured=captured
+            )
             save_npz(
                 output / "tracking.npz",
                 {
@@ -124,19 +165,6 @@ def main(argv=None):
                     "grid": grid,
                 },
             )
-            # Bounded tracked crops allow reconstruction of interior detector misses.
-            matrix, _, basis = camera_model(*size)
-            camera = load_camera_calibration(
-                {
-                    "model": "PINHOLE",
-                    "image_width": size[0],
-                    "image_height": size[1],
-                    "camera_matrix": {"matrix_3x3": matrix.tolist()},
-                    "distortion_coefficients": [],
-                }
-            )
-            meta.update(camera_matrix=matrix.tolist(), intrinsics_basis=basis)
-            cache = output / "prediction_raw.npz"
             if cache.exists():
                 with np.load(cache) as f:
                     prediction = {k: f[k] for k in f.files}
@@ -146,7 +174,6 @@ def main(argv=None):
                 )
             else:
                 n = len(paths)
-                vertices_count = len(assets["left_vert_ids"])
                 prediction = {
                     "trans": np.full((2, n, 3), np.nan, np.float32),
                     "rotmat": np.full((2, n, 25, 3, 3), np.nan, np.float32),
@@ -166,8 +193,9 @@ def main(argv=None):
                 vertices = np.full((2, n, vertices_count, 3), np.nan, np.float32)
                 all_results = {"left": {}, "right": {}}
                 all_boxes = {}
-                for a in range(0, n, 16):
-                    ids = [str(i) for i in range(a, min(a + 16, n))]
+                captured_indices = np.flatnonzero(captured)
+                for a in range(0, len(captured_indices), 16):
+                    ids = [str(i) for i in captured_indices[a : a + 16]]
                     images = [cv2.imread(paths[int(i)]) for i in ids]
                     bboxes = {}
                     for key in ids:
@@ -195,8 +223,8 @@ def main(argv=None):
                     for name in all_results:
                         all_results[name].update(result.get(name, {}))
                     if a % 160 == 0:
-                        print(f"  EgoHand {episode.name}: {a}/{n}", flush=True)
-                for first, last in contiguous_ranges(grid):
+                        print(f"  EgoHand {episode.name}: {a}/{len(captured_indices)}", flush=True)
+                for first, last in contiguous_ranges(grid, captured):
                     ids = [str(i) for i in range(first, last)]
                     result = {
                         s: {k: all_results[s][k] for k in ids if k in all_results[s]}
@@ -258,6 +286,7 @@ def main(argv=None):
                 gap_length,
                 matrix,
                 meta,
+                source_camera=camera if intrinsics is not None else None,
             )
             meta.update(status="complete", wall_s=time.monotonic() - started)
             summaries.append(meta)
@@ -267,9 +296,22 @@ def main(argv=None):
             raise
         finally:
             mp.write_text(json.dumps(meta, ensure_ascii=False, indent=2))
-    (args.output / "summary.json").write_text(
+    (output_dir / "summary.json").write_text(
         json.dumps(summaries, ensure_ascii=False, indent=2)
     )
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "source", nargs="?", type=Path, default=ROOT / "human_demonstration"
+    )
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--intrinsics-json", type=Path)
+    parser.add_argument("--episodes", nargs="+", help="Process only these episode names")
+    args = parser.parse_args(argv)
+    intrinsics = load_head_calibration(args.intrinsics_json) if args.intrinsics_json else None
+    run(args.source, args.output, args.episodes, intrinsics=intrinsics)
 
 
 if __name__ == "__main__":

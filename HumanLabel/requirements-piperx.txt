@@ -1,0 +1,4 @@
+# Optional CPU dependencies for base-frame Piper X retargeting.
+mujoco==3.14.0
+osqp==1.1.3
+PyYAML>=6,<7

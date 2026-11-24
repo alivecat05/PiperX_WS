@@ -2,7 +2,7 @@
 
 ## 当前方案：EgoHand
 
-先完成 [README 的环境安装](../README.md#2-环境配置)，创建并激活你自己的 Conda 或 venv 环境，安装 Python 依赖。
+先完成 [README 的从零安装](../README.md#从零安装)，创建并激活你自己的 Conda 或 venv 环境，安装 Python 依赖。
 以下命令均在克隆所得的 `HumanLabel/` 目录及该环境中执行，不依赖开发者机器上的环境或缓存。
 本流程使用独立的手部检测器；不需要额外安装 RT-DETR、MediaPipe 或完整 IsaacCapture 工具链。
 
@@ -81,3 +81,22 @@ model/
 | 临时文件 | 抽帧和原生预测临时写入 `.cache/`，运行结束或失败后自动清理 |
 | 最终结果 | `result/原母文件夹名/episode_XXX/` |
 | Git 排除项 | `model/`、`.cache/`、虚拟环境、录像、权重、`result/` |
+
+## MuJoCo 回放资源
+
+在 `HumanLabel/` 下准备回放用的 Python 包和 STL。网格与 `configs/piperx/` 的 URDF 使用同一 AgileX 版本。
+
+```bash
+conda activate sim_capture
+python -m pip install -r requirements-piperx.txt 'imageio[ffmpeg]' Pillow
+assets=https://raw.githubusercontent.com/agilexrobotics/agx_arm_urdf/680fa925cd00db7e2628563d2edc5540963045de
+mkdir -p model/piperx_replay
+for mesh in base_link link1 link2 link3 link4 link5 link6 flange; do
+  curl -fL "$assets/piper_x/meshes/$mesh.stl" -o "model/piperx_replay/$mesh.stl" || exit 1
+done
+for mesh in gripper_base gripper_link1 gripper_link2; do
+  curl -fL "$assets/agx_gripper/meshes/$mesh.stl" -o "model/piperx_replay/$mesh.stl" || exit 1
+done
+```
+
+已有 STL 时，可在回放命令中用 `--mesh-dir` 指向网格目录。

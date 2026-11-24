@@ -7,13 +7,14 @@ from pathlib import Path
 from humanlabel.utils.paths import ROOT, temporary_workspace
 
 
-def complete_for(folder, source):
+def complete_for(folder, source, intrinsics=None):
     path = folder / "manifest.json"
     if not path.exists():
         return False
     meta = json.loads(path.read_text())
     return (
         meta.get("status") == "complete"
+        and meta.get("camera_calibration") == intrinsics
         and Path(meta.get("source", "")).resolve() == source.resolve()
         and meta.get("processed_frames")
         == json.loads((source / "manifest.json").read_text())["frames"]
@@ -26,8 +27,18 @@ def main(argv=None):
         "source", nargs="?", type=Path, default=ROOT / "human_demonstration"
     )
     parser.add_argument("--output", type=Path, default=ROOT / "result")
+    parser.add_argument("--intrinsics-json", type=Path, help="Head camera intrinsics JSON")
     parser.add_argument("--piper-config", type=Path)
     args = parser.parse_args(argv)
+    intrinsics, camera_args = None, []
+    if args.intrinsics_json:
+        from humanlabel.utils.camera import load_head_calibration
+
+        try:
+            intrinsics = load_head_calibration(args.intrinsics_json)
+        except (KeyError, OSError, TypeError, ValueError) as exc:
+            parser.error(f"Invalid head calibration {args.intrinsics_json}: {exc}")
+        camera_args = ["--intrinsics-json", str(args.intrinsics_json)]
     source, output = args.source.resolve(), args.output.resolve()
     single_episode = (source / "head.mp4").exists()
     dataset = source.parent if single_episode else source
@@ -45,7 +56,7 @@ def main(argv=None):
             recorded_source = Path(json.loads(manifest.read_text()).get("source", ""))
             if recorded_source.resolve() != episode.resolve():
                 parser.error(f"Output belongs to another source: {manifest}")
-    pending = [p for p in episodes if not complete_for(final / p.name, p)]
+    pending = [p for p in episodes if not complete_for(final / p.name, p, intrinsics)]
     if pending:
         from humanlabel.workflows.egohand import main as infer
         from humanlabel.workflows.recover import main as recover
@@ -57,6 +68,7 @@ def main(argv=None):
                     str(source),
                     "--output",
                     str(native),
+                    *camera_args,
                     "--episodes",
                     *[p.name for p in pending],
                 ]

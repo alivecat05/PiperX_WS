@@ -11,6 +11,7 @@ from humanlabel.export import (
     HEADER,
     camera_wrist_rotations,
     capture_contract,
+    frame_aligned_actions,
     update_episode,
     validate_products,
     wrist_values,
@@ -20,6 +21,32 @@ from humanlabel.export import (
     main as export_main,
 )
 from humanlabel.utils.paths import ROOT
+
+
+def test_frame_actions_hold_each_hand_independently_and_keep_original_timestamps():
+    timestamps = [f"1795057183.{i:09}" for i in range(6)]
+    missing = ["nan"] * 8
+    left_a, left_b = ["1.00"] * 8, ["2.00"] * 8
+    right_a, right_b = ["3.00"] * 8, ["4.00"] * 8
+    rows = [
+        [timestamps[1], *left_a, *missing],
+        [timestamps[2], *missing, *right_a],
+        [timestamps[4], *left_b, *right_b],
+    ]
+    assert frame_aligned_actions(rows, timestamps) == [
+        [timestamps[0], *left_a, *right_a],
+        [timestamps[1], *left_a, *right_a],
+        [timestamps[2], *left_a, *right_a],
+        [timestamps[3], *left_a, *right_a],
+        [timestamps[4], *left_b, *right_b],
+        [timestamps[5], *left_b, *right_b],
+    ]
+
+
+def test_frame_actions_require_a_finite_pose_for_each_hand():
+    rows = [["100.00", *(["1"] * 8), *(["nan"] * 8)]]
+    with pytest.raises(ValueError, match="No valid right hand pose"):
+        frame_aligned_actions(rows, ["100.00", "100.03"])
 
 
 def geometry():

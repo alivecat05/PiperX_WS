@@ -17,7 +17,7 @@ from humanlabel.export import (
     wrist_values,
     write_products,
 )
-from humanlabel.utils.camera import timestamps
+from humanlabel.utils.camera import captured_frames, timestamps
 from humanlabel.utils.tracking import contiguous_ranges
 
 
@@ -37,25 +37,35 @@ def read_episode(episode, max_frames=0):
     return meta, rows[:n], size, fps, count
 
 
-def detections(episode, rows, size, detector_path, cache):
+def load_detector(detector_path, config_dir):
+    os.environ["YOLO_CONFIG_DIR"] = str(config_dir)
+    os.environ["YOLO_AUTOINSTALL"] = "false"
+    from ultralytics import YOLO
+
+    return YOLO(str(detector_path))
+
+
+def detections(episode, rows, size, detector_path, cache, *, detector=None):
     """Shared detector baseline; original frame indexes are never re-timed."""
     cache.mkdir(parents=True, exist_ok=True)
     stat = (episode / "head.mp4").stat()
+    captured = captured_frames(rows)
+    paths = [str(cache / f"{i:06d}.jpg") for i in range(len(rows))]
     signature = hashlib.sha256(
         (
             str(episode.resolve())
             + str((stat.st_size, stat.st_mtime_ns))
-            + "yolo960_conf015_v1"
+            + "yolo960_conf015_v2"
         ).encode()
+        + captured.tobytes()
     ).hexdigest()
     record = cache / "detections.json"
     if record.exists():
         d = json.loads(record.read_text())
-        paths = [str(cache / f"{i:06d}.jpg") for i in range(len(rows))]
         if (
             d["signature"] == signature
             and len(d["detections"]) >= len(rows)
-            and all(Path(p).exists() for p in paths)
+            and all(Path(path).exists() for path, valid in zip(paths, captured) if valid)
         ):
             return [
                 np.asarray(x, np.float32).reshape(-1, 6)
@@ -63,49 +73,47 @@ def detections(episode, rows, size, detector_path, cache):
             ], paths
     import torch
 
-    os.environ["YOLO_CONFIG_DIR"] = str(cache.parent.parent / "yolo")
-    # Runtime inference must use the prepared environment, without pip installs.
-    os.environ["YOLO_AUTOINSTALL"] = "false"
-    from ultralytics import YOLO
-
-    torch.set_num_threads(8)
-    detector = YOLO(str(detector_path))
+    if detector is None:
+        torch.set_num_threads(8)
+        detector = load_detector(detector_path, cache.parent.parent / "yolo")
     cap = cv2.VideoCapture(str(episode / "head.mp4"))
-    output, paths, images = [], [], []
-    for i in range(len(rows)):
-        ok, image = cap.read()
-        if not ok:
-            raise ValueError(f"Decode failed at frame {i}")
-        path = cache / f"{i:06d}.jpg"
-        if not cv2.imwrite(str(path), image, [cv2.IMWRITE_JPEG_QUALITY, 95]):
-            raise IOError(path)
-        paths.append(str(path))
-        images.append(image)
-        if len(images) == 16 or i == len(rows) - 1:
-            with torch.inference_mode():
-                results = detector.predict(
-                    images,
-                    device="cuda",
-                    imgsz=960,
-                    conf=0.15,
-                    iou=0.45,
-                    verbose=False,
-                    half=False,
-                )
-            for r in results:
-                output.append(
-                    np.column_stack(
+    output = [np.empty((0, 6), np.float32) for _ in rows]
+    frame_ids, images = [], []
+    try:
+        for i, (path, valid) in enumerate(zip(paths, captured)):
+            ok, image = cap.read() if valid else (cap.grab(), None)
+            if not ok:
+                raise ValueError(f"Decode failed at frame {i}")
+            if valid:
+                if not cv2.imwrite(path, image, [cv2.IMWRITE_JPEG_QUALITY, 95]):
+                    raise IOError(path)
+                frame_ids.append(i)
+                images.append(image)
+            if images and (len(images) == 16 or i == len(rows) - 1):
+                with torch.inference_mode():
+                    results = detector.predict(
+                        images,
+                        device="cuda",
+                        imgsz=960,
+                        conf=0.15,
+                        iou=0.45,
+                        verbose=False,
+                        half=False,
+                    )
+                for index, r in zip(frame_ids, results, strict=True):
+                    output[index] = np.column_stack(
                         (
                             r.boxes.xyxy.cpu().numpy(),
                             r.boxes.conf.cpu().numpy(),
                             r.boxes.cls.cpu().numpy(),
                         )
                     ).astype(np.float32)
-                )
-            images.clear()
-        if (i + 1) % 300 == 0:
-            print(f"  detector {episode.name}: {i + 1}/{len(rows)}", flush=True)
-    cap.release()
+                frame_ids.clear()
+                images.clear()
+            if (i + 1) % 300 == 0:
+                print(f"  detector {episode.name}: {i + 1}/{len(rows)}", flush=True)
+    finally:
+        cap.release()
     record.write_text(
         json.dumps(
             {
@@ -143,8 +151,13 @@ def export(
     matrix,
     meta,
     no_preview=False,
+    *,
+    source_camera=None,
 ):
     n = len(rows)
+    captured = captured_frames(rows)
+    observed = observed & captured
+    supported = supported & captured
     contract = rotation_contract(capture_contract(), meta["representation"])
     meta.update(
         epose_export=contract,
@@ -188,10 +201,13 @@ def export(
         finite = np.isfinite(joints[side]).all((1, 2))
         ids = np.flatnonzero(finite)
         if len(ids):
-            focal = np.stack((matrices[ids, 0, 0], matrices[ids, 1, 1]), -1)
-            pixels[side, ids] = (
-                joints[side, ids, :, :2] / joints[side, ids, :, 2:]
-            ) * focal[:, None] + matrices[ids, None, :2, 2]
+            if source_camera is not None:
+                pixels[side, ids] = source_camera.project(joints[side, ids])
+            else:
+                focal = np.stack((matrices[ids, 0, 0], matrices[ids, 1, 1]), -1)
+                pixels[side, ids] = (
+                    joints[side, ids, :, :2] / joints[side, ids, :, 2:]
+                ) * focal[:, None] + matrices[ids, None, :2, 2]
         geometry = (
             finite
             & (joints[side, :, :, 2] > 0.01).all(-1)
@@ -228,8 +244,9 @@ def export(
             ),
         },
     )
-    capture_segment = np.zeros(n, int)
-    for k, (a, b) in enumerate(contiguous_ranges([int(r["grid_index"]) for r in rows])):
+    capture_segment = np.full(n, -1, int)
+    ranges = contiguous_ranges([int(r["grid_index"]) for r in rows], captured)
+    for k, (a, b) in enumerate(ranges):
         capture_segment[a:b] = k
     preview = None
     if not no_preview:
@@ -302,7 +319,9 @@ def export(
                     )
                 for side, name in enumerate(("left", "right")):
                     source = (
-                        "image_temporal"
+                        "capture_placeholder"
+                        if not captured[i]
+                        else "image_temporal"
                         if observed[side, i]
                         else "tracked_crop"
                         if supported[side, i]
@@ -339,7 +358,9 @@ def export(
                         int(valid[side, i]),
                         int(valid[side, i] and np.isfinite(pinch)),
                         "head" if valid[side, i] else "none",
-                        source if valid[side, i] else "unsupported_or_invalid_geometry",
+                        source
+                        if valid[side, i] or not captured[i]
+                        else "unsupported_or_invalid_geometry",
                         pinch,
                         float(values[i, side * 8 + 7]),
                     ]
@@ -360,10 +381,13 @@ def export(
                             pts = pixels[side, i]
                             verts = vertices[side, i]
                             frame_matrix = matrices[i]
-                            vp = (
-                                verts[:, :2] / verts[:, 2:] * np.diag(frame_matrix)[:2]
-                                + frame_matrix[:2, 2]
-                            )
+                            if source_camera is not None:
+                                vp = source_camera.project(verts)
+                            else:
+                                vp = (
+                                    verts[:, :2] / verts[:, 2:] * np.diag(frame_matrix)[:2]
+                                    + frame_matrix[:2, 2]
+                                )
                             triangles = vp[faces_left if side == 0 else faces_right]
                             good = np.isfinite(triangles).all((1, 2)) & (
                                 np.abs(triangles).max((1, 2)) < 4 * max(size)

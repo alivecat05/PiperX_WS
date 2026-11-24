@@ -3,12 +3,15 @@
 import numpy as np
 
 
-def contiguous_ranges(grid):
+def contiguous_ranges(grid, captured=None):
+    """Return contiguous source index ranges, excluding optional placeholder frames."""
     grid = np.asarray(grid, dtype=np.int64)
-    if len(grid) == 0:
+    indices = np.arange(len(grid)) if captured is None else np.flatnonzero(captured)
+    if not len(indices):
         return []
-    edges = np.r_[0, np.flatnonzero(np.diff(grid) != 1) + 1, len(grid)]
-    return list(zip(edges[:-1], edges[1:]))
+    breaks = (np.diff(indices) != 1) | (np.diff(grid[indices]) != 1)
+    edges = np.r_[0, np.flatnonzero(breaks) + 1, len(indices)]
+    return list(zip(indices[edges[:-1]], indices[edges[1:] - 1] + 1))
 
 
 def runs(mask):
@@ -16,7 +19,7 @@ def runs(mask):
     return list(zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)))
 
 
-def track_boxes(detections, grid, max_gap=90):
+def track_boxes(detections, grid, max_gap=90, *, captured=None):
     """Viterbi association uses both time directions and soft handedness costs.
 
     Candidate states contain one box per anatomical side or a missing state.
@@ -25,7 +28,8 @@ def track_boxes(detections, grid, max_gap=90):
     n = len(detections)
     boxes = np.full((2, n, 4), np.nan, np.float32)
     scores = np.zeros((2, n), np.float32)
-    for start, end in contiguous_ranges(grid):
+    ranges = contiguous_ranges(grid, captured)
+    for start, end in ranges:
         states, costs, links = [], [], []
         for t in range(start, end):
             d = detections[t]
@@ -87,7 +91,7 @@ def track_boxes(detections, grid, max_gap=90):
     observed = np.isfinite(boxes).all(-1)
     supported = observed.copy()
     gap_length = np.zeros((2, n), np.int32)
-    for start, end in contiguous_ranges(grid):
+    for start, end in ranges:
         for side in range(2):
             for a, b in runs(~observed[side, start:end]):
                 a, b = a + start, b + start

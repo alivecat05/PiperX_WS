@@ -7,6 +7,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from humanlabel.utils.camera import captured_frames
+
 
 def validate(folder):
     meta = json.loads((folder / "manifest.json").read_text())
@@ -32,6 +34,7 @@ def validate(folder):
             or r[0] != s["timestamp_unix_s"]
         ):
             raise ValueError(f"Source frame/time mismatch at {i}")
+    captured = captured_frames(source)
     last = None
     for i, (m, row) in enumerate(zip(mapping, actions[1:])):
         frame = int(m["frame_index"])
@@ -40,6 +43,8 @@ def validate(folder):
             or not np.isfinite(np.asarray(row, float)).all()
         ):
             raise ValueError("Invalid dense action mapping")
+        if not 0 <= frame < n or not captured[frame]:
+            raise ValueError(f"Action references an invalid source frame: {frame}")
         if row != raw[1 + frame]:
             raise ValueError("Action values do not match raw frame")
         if last is not None and m["segment_id"] == last["segment_id"]:
@@ -119,17 +124,17 @@ def validate(folder):
                 acc = np.linalg.norm(np.diff(joints[side], n=2, axis=0), axis=-1)[
                     triple
                 ]
-                focal = np.stack((matrices[:, 0, 0], matrices[:, 1, 1]), -1)
-                pixels = (
-                    joints[side, :, :, :2] / joints[side, :, :, 2:] * focal[:, None]
-                    + matrices[:, None, :2, 2]
-                )
-                pixel_delta = np.linalg.norm(np.diff(pixels[:, 0], axis=0), axis=-1)[
-                    adjacent
-                ]
-                pixel_acc = np.linalg.norm(np.diff(pixels, n=2, axis=0), axis=-1)[
-                    triple
-                ]
+                if meta.get("camera_calibration") is not None:
+                    pixels = np.asarray(
+                        [[q[f"{name}.wrist_u_px"], q[f"{name}.wrist_v_px"]] for q in quality],
+                        dtype=float,
+                    )
+                else:
+                    focal = np.stack((matrices[:, 0, 0], matrices[:, 1, 1]), -1)
+                    wrist = joints[side, :, 0]
+                    pixels = wrist[:, :2] / wrist[:, 2:] * focal + matrices[:, :2, 2]
+                pixel_delta = np.linalg.norm(np.diff(pixels, axis=0), axis=-1)[adjacent]
+                pixel_acc = np.linalg.norm(np.diff(pixels, n=2, axis=0), axis=-1)[triple]
                 report["motion_statistics"][name] = {
                     "valid_frames": int(good.sum()),
                     "consecutive_wrist_step_p95_mm": float(
