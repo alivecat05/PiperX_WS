@@ -1,153 +1,64 @@
-﻿# PiperX 双臂遥操
+# PiperX_Teleop
 
-[简体中文](README.md) | [English](README.en.md)
+[English](README.en.md)
 
-Windows · Meta Quest 3 · 官方 pyAgxArm · 头部 D555 + 双腕 D405
+用 Quest 3 遥操双臂 Piper X，并录制三路 RGB、动作和状态。
 
-## 功能
+## 环境配置
 
-- 双臂相对位姿遥操、扳机比例控制夹爪、自定义初始位。
-- **电脑本地**三视角 RGB 窗口，显示相机 FPS、action Hz、录制状态。
-- 30 Hz 软件对齐的 RGB + 双臂 action/state；一键转 LeRobot v3。
-- Quest 支持 USB / Wi-Fi；录制独立于机械臂运动。
-
-## 1. 安装（首次）
-
-Windows 10/11 x64，联网；项目路径建议不含空格。
+在 Windows 的 `PiperX_Teleop/` 目录安装环境并查找设备。
 
 ```powershell
-git clone https://github.com/alivecat05/PiperX_WS.git
-cd PiperX_WS/PiperX_Teleop
 .\setup.cmd
-```
-
-自动安装项目内 Conda、Python 3.12、RealSense、机器人 SDK 和 ADB，不覆盖已有 `config.json`。USB-CAN 须安装硬件厂商提供的 Windows 驱动。
-
-## 2. 配置硬件
-
-```powershell
 .\teleop.cmd discover
 ```
 
-仓库已包含当前硬件的 `config.json`，保留相机序列号、CAN 映射、复位航点和遥操参数。新电脑使用同一套硬件时可沿用；安装脚本不覆盖已有配置。更换硬件时编辑 `config.json`：
+安装 USB-CAN 适配器驱动，在 `config.json` 中核对相机序列号、CAN 通道、固件、TCP 偏移、工作区和回位航点。
 
-- `cameras.*.serial`：填头部、左腕、右腕相机序列号。
-- `arms.*.channel`：核对左右 USB-CAN 编号；示例左 1、右 0。
-- `arms.*.firmware`：匹配 SDK 固件 profile；当前配置 `v189`。
-- `tcp_offset / xr_to_base / workspace_*`：按工具和机械臂安装方向调整。
-- `arms.left.position_scale`、`arms.right.position_scale`：独立设置手柄位移倍率，保存后重启生效。`0.7` 表示手移动 10 cm 对应机器人目标移动 7 cm；`1.0` 为 10 cm，`1.5` 为 15 cm。允许范围 `(0, 5]`，窗口底部显示 `Scale L/R`。
-- `arms.*.pose_smoothing_s`：额外固定平滑默认 `0`。`tremor_smoothing_s` 默认 `0.04` 秒，启用自适应微抖滤波：小幅变化使用最多 40 ms 的时间常数，明确移动时缩短至约 10 ms，不改变位移倍率。`position_deadband_m` 默认 `0.001` 米、`rotation_deadband_rad` 默认 `0.008726646`（0.5°），保留微抖死区。食指夹爪比例独立。
+## 使用方法
 
-相机明确仅启用 RGB，不启用深度流；启动自动曝光预热 2 秒后锁定各自当前曝光与增益，同次运行重连复用锁定值。锁定参数以传感器原生 SDK 单位记录在相机元数据、日志及详细诊断中。当前硬件配置位移倍率为 1.0、旋转限速 2 rad/s、平移限速 0.5 m/s；接管不再额外等待手移动 5 mm 或旋转 3°。1:1 表示位移比例，死区、速度上限和机械臂本身响应仍影响瞬时误差。
-
-D405 的自动曝光值优先从帧元数据读取；`get_option(exposure)` 可能仍返回手动默认值 33000。对以微秒计量的传感器，锁定曝光不超过帧周期的 90%（30 FPS 时为 30000 µs），避免固定 33000 µs 导致本机 D405 实际降为 15 FPS。D555 保留原生单位，不套用 D405 的单位换算。
-
-每次按中指接管都会用当前位置作为本次参考区中心，读取手柄朝向与实际 TCP 朝向，建立本次姿态偏置。接管本身保持机器人原位；松开后下次重新记录零点。这只能消除起始姿态差，不能单独确定头显参考系到机器人基座的轴向。
-
-松开中指时，保持**松开前最后一次成功下发的滤波后 TCP 位置和姿态**。松开那一帧的新手柄位置不参与计算，滞后的机械臂反馈不替换保持点；滤波尚未追完的余量立即丢弃。闲置期间不继续推进滤波，也不切换关节模式或更改速度，保持目标只在再次主动接管时更新；夹爪仍按食指独立控制，采集和另一臂继续。再次按中指以当时实际位姿建立新参考，不重放松手期间的输入。
-
-当前 `joint_guard_enabled=false`，关闭此前加入的局部关节预测投影，避免它改变跟随方向和响应；控制器硬限位、工作空间与笛卡尔限速保留。目标领先实际 TCP 超过 `max_position_tracking_error_m` 时限幅继续跟随，保留 0.1 m 预算，不再叠加 3 cm 限制或全局中断。展开诊断可区分映射目标误差与机器人实际跟随误差。
-
-### 启动时对齐头显方向
-
-本项目实际输入为 `frame.getPose(gripSpace, local-floor)`，采用 WebXR 右手坐标：参考系 +X 向右、+Y 向上、−Z 向前；`local-floor` 的水平朝向由平台初始化，不保证与工作台相同。手柄自身 `gripSpace` 的局部轴不能直接当作位置参考轴。[WebXR 坐标与 reference space 规范](https://immersive-web.github.io/webxr/#xrreferencespace)
-
-PiperX 手册 §2.2.2（PDF 第 17 页）定义用户坐标为机械臂基座坐标，轴向以基座图为准，不能把房间里的“前”固定当作基座 +X。[官方 PiperX 手册](https://cdn.shopify.com/s/files/1/0551/0630/6141/files/PIPER_X_USER_MANUAL.pdf?v=1791861496#page=17)。SDK 末端姿态为米／弧度，固定轴 XYZ 欧拉角，`R=Rz(yaw)Ry(pitch)Rx(roll)`，与代码 `Rotation.from_euler("xyz", ...)` 一致。[官方 SDK 定义](https://github.com/agilexrobotics/pyAgxArm/blob/master/pyAgxArm/protocols/can_protocol/drivers/piper/default/driver.py)
-
-现场已确认：**当前设备和双臂安装下，让头显正对机械臂基座 X 轴方向，再在 Quest 浏览器点击「启动手柄追踪」，跟随方向即正确，无需三点轴向标定。**
-
-1. 启动追踪前，按现场已验证正确的方向摆正头显，让头显前方与机械臂基座 +X 方向一致。
-2. 在 Quest 中点击「启动手柄追踪」。当前固定映射为 WebXR −Z → 基座 +X、−X → 基座 +Y、+Y → 基座 +Z，即前／左／上分别对应基座 +X／+Y／+Z。
-3. 按中指接管，软件自动以当前手柄位置和实际 TCP 姿态记录本次参考，不需要手动采样。B 始终开始录制，A 停止并保存。
-
-启动后使用稳定的 `local-floor` 参考系，转头不会让软件逐帧旋转跟随轴。重新进入追踪时保持同样的启动朝向；参考系 reset 时原有逻辑结束 XR 会话，重新启动追踪并接管。固定矩阵继续来自 `xr_to_base`，本次接管参考姿态记入 `/status`、日志及 episode 的 `teleop_coordinate_calibration` 配置快照。三点标定入口及采样状态已移除。
-
-位移倍率决定目标距离，`max_speed_m_s` 决定上位机目标限速，`speed_percent` 决定 SDK 点位运动速度比例，`workspace_min/max` 决定可达范围。新版跟随配置为 `0.5 m/s`、`2 rad/s`、SDK `100%`，复位仍使用独立的 `reset_speed_percent=10`。旧配置的 `0.12 m/s` 加 SDK `15%` 会使目标与实体机械臂两次受限，手到位后仍追赶。窗口底部 `Follow` 显示目标跟踪误差、命令年龄和 `limited`；`limited=1` 表示手部映射动作已触及上位机速度上限。实体加减速、逆解和 CAN 延迟仍需实机测量，不能保证任意手速下零延迟。
-
-先把双臂摆到展开的工作姿态，避免收拢零位；进入程序后长按 **X** 保存初始位。相机参数和初始位仅保存在本机。
-
-## 3. 连接 Quest（二选一）
-
-**USB（默认）**：Quest 开启开发者模式，连 USB，在头显内允许 USB 调试。直接运行以下命令，等同于添加 `--transport usb`。
+通过 **USB** 连接前，在 Quest 开启开发者模式并允许调试。运行后在 Quest 打开 `http://localhost:8012`。
 
 ```powershell
 .\teleop.cmd
 ```
 
-Quest 浏览器打开 **http://localhost:8012**，先正对机械臂基座 X 轴方向，再点击“启动手柄追踪”。
-
-**Wi-Fi**：两台设备连接同一 Wi-Fi。把下面地址换成电脑 **WLAN 网卡的 IPv4**；防火墙允许 TCP 8012。
+通过 **Wi-Fi** 连接时，把电脑和 Quest 接入同一网络，将示例 IP 换成电脑的 WLAN 地址并放行 TCP 8012。Quest 打开终端显示的 HTTPS 地址。
 
 ```powershell
 .\teleop.cmd cert --ip 192.168.1.100
 .\teleop.cmd --transport wifi --cert certs/cert.pem --key certs/key.pem
 ```
 
-Quest 打开终端显示的 **https://地址:8012**，无需 token。证书首次生成、IP 改变后重建；自签证书可能提示不受信任，USB 无此提示。
+### 启动时对齐头显方向
 
-**挂胸前使用**：先连 USB 执行 `.\teleop.cmd awake`，再启动追踪；摄像头朝前且无遮挡。结束执行 `.\teleop.cmd sleep`；头显重启后需重新 `awake`。无需 MQDH，但仍依赖头显看得到手柄，挂胸前稳定性需实测。
+头显朝向机械臂基座 +X 后再点「启动手柄追踪」。按住中指键接管对应臂，松开后保持最后下发的位姿。食指扳机独立控制夹爪。
 
-## 4. 手柄操作
+| 按键 | 操作 |
+| --- | --- |
+| B / A | 开始录制 / 停止并保存 |
+| X 长按 2 秒 | 保存当前双臂位姿为初始位 |
+| Y 长按 1.5 秒 | 按已配置航点将两臂回到初始位 |
 
-- **左右中指键**：按住对应臂跟随；松开后冻结松开前最后下发的滤波位姿，并立即丢弃滤波余量。再次按住时以当前实际位姿重新接管。
-- **左右食指扳机**：半按半闭，全按闭合，松开张开；不必按中指键。
-- **B**：开始录制。
-- **A**：停止并保存；等待 `SAVING` 结束后再开下一段。
-- **X 长按 2 秒**：保存当前双臂位置为初始位。
-- **Y 长按 1.5 秒**：两臂同时开始回初始位，各自依次经过本臂航点；两臂均到位后完成。松开再按 Y 可同时取消两臂复位。
+保存初始位和回位前，松开中指键并等待录制保存完成。回放 CSV 时先点「加载 CSV」，确认路径畅通后点「到起点并回放」。用「停止回放」或空格停止。
 
-X/Y 前松开双中指键，并结束录制、等待保存。电脑窗口按 **Q / Esc** 退出。
+### 挂脖采集
 
-正常退出（Q / Esc、关闭预览窗口或 Ctrl+C）会用新鲜反馈保持双臂当前位置和夹爪宽度，再断开 CAN，保留原有使能状态。发生故障、反馈过期或保持失败时仍执行急停保护；启动程序后按住中指键接管对应臂时使能。
+连接 USB 执行 `.\teleop.cmd awake`，让 Quest 摄像头持续看到手柄。结束后执行 `.\teleop.cmd sleep`。
 
-### 采集窗口
+导出 LeRobot 时，首次运行 `.\setup.cmd -Export`，之后用 `.\export.cmd`。结果位于 `datasets/piperx/`。
 
-窗口采用白色主题。顶部用绿色状态带表示「就绪 · 未采集」，红色状态带表示「采集中」；保存、保护保持和回放使用独立提示。
-
-- 「任务名」「采集序号」和「自动递增」编辑后自动同步，无需另点「应用设置」；Quest B 使用同步后的设置，桌面「开始采集」也会同时应用当前输入。无效任务名或序号会阻止开始采集，旧状态回传不会覆盖正在编辑的内容。
-- 序号可自定义，例如从 42 开始。勾选「自动递增」后，本段结束时自动选择 43，遇到已存在目录则继续跳过；不完整的采集也会占用序号，避免覆盖。取消勾选后，下段需手动更换序号。
-- 「下一个可用序号」按所填任务目录已有数据建议新序号。采集和保存时锁定任务与序号。
-- 默认任务取 `config.json` 的 `task`；窗口更改在本次运行生效，输出目录保留任务名。
-- 保护保持时显示中文原因、两臂保持状态和分步处理方法。配置为 v189 时，「恢复遥操」可主动退出示教并请求保持当前关节位置；等待新鲜 CAN 反馈确认，再检查跟踪、按键、使能及限位条件。不会通过 reset 退出示教；其他固件需手动退出。原始状态可展开「显示详细诊断」查看。
-
-### CSV 轨迹回放
-
-1. 在「Action CSV 路径」粘贴本软件生成的 `action.csv` 完整路径，点击「加载 CSV」。加载在后台校验格式、时间戳、工作空间、夹爪宽度和四元数，不启动运动。
-2. 设置回放倍率（`0.1`～`1.0`，默认原速 `1.0`），确认运动路径畅通，点击「到起点并回放」。采集/保存、复位或故障恢复期间不能启动回放。
-3. 两臂先同时低速定位到首帧：SDK 速度 10%，目标平移不超过 0.05 m/s、旋转不超过 0.35 rad/s；定位保持原夹爪宽度。两臂位置误差均 ≤3 mm、姿态误差均 ≤2° 并稳定 0.3 秒后，恢复跟随速度并从 CSV 时间零点开始回放。
-4. 按真实时间戳插值位移和旋转，默认保留原始节奏；速度超过当前配置上限会拒绝启动，并提示降低倍率。回放不要求 Quest 在线。
-5. 定位和回放均可点击「停止回放」或按空格停止，Quest 在线时按 Y 也可停止。停止后保留最后目标；完成后保留末帧。恢复遥操需松开按键并重新接管。
-
-越限、跟踪误差或定位超时沿用保持恢复流程；不会自动跳过故障或回放旧的排队指令。实机回放和定位路径尚需现场验证。
-
-## 5. 导出数据
+## 验证方法
 
 ```powershell
-.\setup.cmd -Export    # 首次安装导出环境
-.\export.cmd           # 一键转换
+.\teleop.cmd --mock
+.\teleop.cmd --transport usb --input-test
 ```
 
-原始数据：`outputs/episodes/<task>/episode_001/`（任务名和序号由窗口设置）；LeRobot：`datasets/piperx/`，默认不上传、排除未完成/模拟数据。旧 JPEG 数据仍可导出。
+第一条使用模拟设备。第二条检查 Quest 和真实相机输入，机器人使用模拟反馈。[实机前检查和验证记录](docs/validation.md)
 
-每段保存 `head.mp4`、`left_wrist.mp4`、`right_wrist.mp4`、`action.csv`、`samples.jsonl`、`manifest.json`，与 PiperCapture 使用相同的视频/CSV 对齐方式：三路视频第 N 帧对应 CSV 第 N 个数据行及 JSONL 第 N 行。CSV 为 `timestamp_unix_s` 加 16 维 action；JSONL 保存各路真实来源时间戳、帧号、state 和时间基准。
+## 数据格式
 
-录制使用 **30 Hz 固定时间网格**，三路图像、双臂 action 和 state 的来源时间戳最大跨度限制为 **一帧（33.33 ms）**。优先启用 RealSense SDK Global Timestamp，SDK `system_time` 也会保留其帧时间；仅能获得原始硬件时钟时允许预览，拒绝以 Python 接收时间冒充同步采集。D555 的 DDS Global Timestamp 支持取决于 SDK/固件，应核对实际 `camera_timestamps`。Global Timestamp 是时钟对齐，曝光误差还需实测验证。
+`outputs/episodes/<任务>/episode_001/` 保存三路 30 FPS MP4、`action.csv`、`samples.jsonl` 和 `manifest.json`。三路视频和数据逐帧对应。
 
-MP4 保留完整的采集时间轴，缺帧不再通过减少视频帧数压缩播放时间。缺失位置保持上一组图像，首帧前用黑帧，逐行标记 `sample_valid=false`、`frame_status=held/blank` 和 `held_from_grid`，保留原来源时间戳；新真实同步帧才标记 `captured`。manifest 记录有效帧数、占位帧数和采集／视频时长，含占位的片段仍为 `incomplete`。例如 30 秒内只有 150 组真实图像时，视频仍为 900 帧、30 秒；缺失的观测或动作不能恢复，占位不作为有效训练／示教数据，默认导出与回放会拒绝它们。
-
-匹配器只把未使用过的真实相机帧作为有效样本，保留来源帧序。后台线程编码完整 30 FPS 时间轴，控制线程不等待磁盘；写盘队列满时记录缺口，后续以明确标记的占位补足时间，不因此中断遥操。缺失任何网格帧时持续记录缺帧原因，整段标为 `incomplete`；`manifest.json` 保存 `effective_fps`、`dropped_grid_ticks`、`drop_reasons`、`observed_max_synchronization_span_s`，避免把实际 20–25 Hz 的不完整数据当作合格 30 Hz 数据。
-
-`action` 是已发送目标，`state` 是实际反馈；均为左右各 `[x,y,z,qx,qy,qz,qw,夹爪宽度]`，共 16 维，长度单位米、各臂基座坐标。同步为软件时间对齐，不是曝光级硬同步。
-
-## 排查
-
-- **安装时连接意外关闭**：重新运行 `.\setup.cmd`（导出环境加 `-Export`）。脚本优先使用清华镜像、失败后回退 GitHub，自动重试并校验安装包；完整缓存会复用，中断或校验失败的文件会重新下载。仍失败时检查代理或网络是否能访问这两个下载源。
-- **先测手柄，不动机器人**：`.\teleop.cmd --transport usb --input-test`；看窗口中的追踪、中指和扳机状态。
-- **无硬件模拟**：`.\teleop.cmd --transport usb --mock`。
-- **paused**：恢复所需手柄追踪，松开按键/扳机 0.3 秒后再按；夹爪需重新捏扳机。闲置手柄丢失不阻断另一只手。
-- **相机提示**：相机低帧率、未更新、预热、时间戳未同步或 SDK 异常只在底部提示，自动重连，遥操与当前录制继续。同步失败的位置明确记为无效占位。相机不再参与机器人就绪及恢复条件。
-- **单臂目标拒绝**：控制器状态 4 且错误位为 0 时，只向该臂请求当前关节保持，停止向它发送笛卡尔目标，另一臂与采集继续。控制器正常后松开中指，再按中指重新校准接管；不 reset、不失能。界面提示请求保持，不把未确认的保持宣称为已锁住。
-- **recovery**：示教等需要明确恢复的状态保留恢复流程。示教期间不发送运动指令；手动退出后用新实测关节位置替换旧目标，两臂均为 NORMAL 且保持使能、Quest 有效、按键/扳机松开 0.3 秒时自动走恢复流程，再要求重新按中指接管。未使能或故障未清除时不强制恢复，通信及电机硬故障保护保留。
-- **fault**：查看 `outputs/logs/teleop.log`。若需清除支持恢复的控制器故障，先退出程序、**支撑好双臂**，再执行 `.\teleop.cmd recover --supported`；恢复会断开电机动力，不是回初始位。
-
-代码：`piperx_teleop/`；测试：`tests/`；第三方 SDK：`vendor/`（保留各自许可证）。[验证与限制](docs/validation.md)
+CSV 保存 Unix 秒时间戳以及左右臂各 8 维 `x,y,z,qx,qy,qz,qw,gripper`。位姿在各臂基座系，位置和开口单位为米。`action` 是软件下发的目标，JSONL 中的 `state` 是实测反馈。缺帧用保持画面或黑帧保留时间轴，标记为 `sample_valid=false`。

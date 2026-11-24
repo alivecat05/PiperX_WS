@@ -1,95 +1,39 @@
 # HumanCapture
 
-[简体中文](README.md) | [English](README.en.md)
+[English](README.en.md)
 
-人类示范三相机 RGB 采集：两台 D405i 腕部相机和一台 D555 头部相机。独立运行，不需要 Quest、CAN 或机械臂 SDK。界面为白色主题，三路实时视频分别显示 FPS、相机帧号及时间戳来源；绿色带表示就绪未采集，红色带表示采集中。
+同步录制人类示范的头部 D555 和双腕 D405i RGB 视频。
 
-## 启动
+## 环境配置
 
-首次运行需安装包含 Tk 的 Python 3.12，或先完成相邻 `PiperX_Teleop` 的环境安装。在 PowerShell 中进入本仓库的 `HumanCapture/`：
+在 Windows 安装带 Tk 的 Python 3.12，再进入 `HumanCapture/` 安装依赖并查找设备。
 
 ```powershell
-cd D:\PiperX_WS\HumanCapture
 .\setup.cmd
 .\capture.cmd discover
+```
+
+`setup.cmd` 创建 `.venv`。按 `discover` 的结果在 `config.json` 中核对相机序列号和 RGB 模式。
+
+## 使用方法
+
+```powershell
 .\capture.cmd
 ```
 
-`setup.cmd` 会创建本机独立的 `.venv` 并安装依赖；仓库不包含开发者的环境。后续启动只需运行 `.\capture.cmd`。如果已在本机安装相邻 PiperX_Teleop 的环境，启动脚本也支持直接复用。
+三路画面就绪后输入任务名和采集序号，点击「开始录制」，完成后点「结束录制并保存」。勾选自动递增可接着录下一段。使用键盘型踏板时，在采集窗口点击「识别踏板」完成绑定，前台窗口中的每次踩踏切换开始和保存。
 
-仓库已包含当前设备的 `config.json`，保留三台相机序列号、采集参数和已识别的踏板键（当前 F8）；迁移到新电脑继续使用同一套硬件时可直接沿用，setup 不覆盖已有配置。更换相机时更新 `cameras` 中的序列号。缺少配置时可复制 `config.example.json`（setup 会自动复制）。`discover` 列出 SDK 可见设备及实际 RGB 模式。配置示例为 DDS domain 0、D555 896×504@30、双腕 640×480@30；当前设备配置使用 D555 1280×800@30、双腕 1280×720@30。`model: D405` 可以匹配包含 D405 的设备型号。以实际枚举结果为准，不会静默换用低帧率模式。三台相机均开启后才允许录制。
-
-只测试软件而不连接设备：
+## 验证方法
 
 ```powershell
-.\capture.cmd --mock
 .\capture.cmd --mock --smoke-seconds 6
+.\capture.cmd --diagnose-seconds 300
 ```
 
-模拟数据的 manifest 中包含 `simulated: true`。无相机序列号时真实运行会提示配置错误。
+第一条用模拟相机检查写盘，第二条读取实机相机并记录诊断到 `outputs/logs/capture.log`。[验证说明](docs/validation.md)
 
-## 操作
+## 数据格式
 
-1. 输入任务名、自定义采集序号；有效输入自动同步，开始按钮也会直接使用当前输入。
-2. 绿色状态带出现后，点击「开始录制」。录制、保存期间锁定任务及序号。
-3. 点击「结束录制并保存」。软件对齐截止前的末尾帧，再完成 MP4 写盘和帧数校验；保存结束前不能开始下一段。
-4. 勾选自动递增后，保存结束自动选择下一个序号，跳过已占用目录。也可点击「下一个可用序号」。不覆盖已有数据，包括不完整片段。
+数据写入 `outputs/episodes/<任务>/episode_001/`。三路 MP4 以 30 FPS 保存，与 `timestamps.csv` 和 `samples.jsonl` 逐帧对应。`manifest.json` 记录完成状态、有效帧数和丢帧统计。
 
-关闭窗口会先结束当前录制并保存。相机掉帧、超时、短暂断流或写盘队列满均不会自动结束当前录制；缺失的同步组记入统计，相机自动重连后继续写入同一片段。只有主动结束、关闭程序或实际写盘失败才结束录制。含缺帧的片段保留并标记 `incomplete`；缺帧处保留上一组图像，尚无首帧时用黑帧占位，明确标记为无效样本。设置仅在本次运行生效，默认任务从配置读取。
-
-每次启动先清空 SDK 默认流配置，再仅启用 RGB，校验实际流中没有深度或其他流。各相机先自动曝光预热 2 秒，然后读取并锁定各自的曝光与增益；同次运行重连复用已锁定值，不重新自动曝光。不支持锁定或读回不一致时明确报错。锁定值使用传感器原生 SDK 单位，显示在预览中，也保存在逐帧元数据及日志里。
-
-D405 优先读取自动曝光帧中的实际曝光／增益，避免把仍为 33000 的旧手动选项值误作当前自动曝光值。其微秒曝光上限为帧周期的 90%：30 FPS 时最多 30000 µs；本机实测手动 33000 µs 会使输出降到 15 FPS，30000 µs 恢复约 30 FPS。D555 使用其自身原生单位。
-
-## 踏板开始 / 结束录制
-
-支持模拟键盘按键的 USB 踏板，无需安装额外库：点击「识别踏板」，然后踩一下踏板。此次只识别，不录制；松开后，每次踩下切换「开始录制 / 结束并保存」。绑定自动写入本机 `config.json`，重启后仍有效。识别时按 Esc 取消。
-
-长踩、键盘自动重复和 250 ms 内的触点抖动不会反复切换。保存期间的踩踏会忽略，保存完成后需重新踩一下开始下一段；未就绪或输入无效时会拒绝开始并显示原因。踏板与手动按钮可以混用，开始使用当前输入框中的任务及序号。
-
-采集窗口需处于前台。软件会拦截绑定的键，避免踩踏向任务输入框写入空格或同时点击焦点按钮；键盘上同一个键也会切换录制。建议能编程的踏板使用 F13 等独立键。此入口针对键盘型踏板，串口或其他 HID 协议需适配设备协议。
-
-配置示例（通常使用界面识别即可）：
-
-```json
-"pedal": {
-  "key": "F13",
-  "debounce_ms": 250
-}
-```
-
-## 数据与同步
-
-输出目录为 `outputs/episodes/<任务名>/episode_001/`，其中包含：
-
-- `head.mp4`、`left_wrist.mp4`、`right_wrist.mp4`：三路 30 FPS RGB 视频。
-- `timestamps.csv`：帧索引、30 Hz 网格索引、统一观测 Unix 时间、三路来源 Unix 时间、原始相机帧号、最大时间差。
-- `samples.jsonl`：逐帧时间戳、时钟来源、接收时间与相机元数据。
-- `manifest.json`：任务、序号、配置、是否模拟、完成状态、帧数、丢帧原因及同步统计。
-
-三个 MP4 的第 N 帧与 CSV、JSONL 的第 N 条数据对应（索引从 0 开始）。本软件采集视频，不生成机械臂 action 或估计人体关节。
-
-同步规则参照 PiperX_Teleop：每台相机独立采集线程，SDK 支持时启用 RealSense Global Timestamp；接受 `global_time` / `system_time`，映射到共同的 `perf_counter()` 单调时钟。在 120 ms 缓冲后按固定 30 Hz 网格联合匹配尚未使用的真实帧，来源时间戳总跨度限制在 33.33 ms 内。缓冲用于等待传输到达，不改变同步跨度。无法同步的原始硬件时钟只能预览，不允许开始录制。保存时统一映射为 Unix 秒。
-
-这是基于 SDK 时间戳的软件对齐，不代表三台相机硬件曝光触发同步。有效样本仍要求真实唯一帧。MP4 按完整的 30 Hz 时间轴写入，缺帧位置以保持上帧／黑帧占位；时间轴不会因为缺帧而压缩，30 秒采集的视频时长为 30 秒左右（误差不超过一帧）。例如只有 150 组有效帧时，仍保留 900 个时间点，不再把 30 秒缩成 5 秒。
-
-CSV / JSONL 每行与 MP4 对应。`sample_valid=true`、`frame_status=captured` 才表示新的真实同步帧；`sample_valid=false`、`frame_status=held/blank` 表示占位，`held_from_grid` 指向沿用的有效帧，来源时间戳保持原值或为 null。不要把占位帧当作新观测。manifest 的 `valid_frames/placeholder_frames` 区分两者，`video_duration_s/capture_duration_s` 用于核对时长；`effective_fps` 仍只统计有效来源速率。
-
-GUI 预览、同步调度、相机采集及视频编码分别运行，预览缩放不会降低保存分辨率。曝光预热期间也关闭自动曝光优先降帧选项；实际硬件是否持续 30 FPS 仍需查看界面和保存统计。相机历史缩短为同步缓冲加 0.5 秒，写盘队列以约 128 MiB 为上限，避免当前全分辨率配置下原先约 1.3 GB 的图像缓存压力。
-
-排查缺帧时查看 `manifest.json`：`camera_diagnostics` 中的 `source_gaps` 表示 SDK 帧号缺口，`max_receive_gap_ms` 表示接收间隔峰值，`arrival_delay_ms` 表示最近帧传输/时钟映射后的到达延迟，`timeouts/reconnects/timestamp_rejections` 区分断流和时钟异常。`writer_diagnostics` 保存编码耗时及队列峰值；`drop_reasons.writer_queue_full` 表示编码或写盘积压。源帧完整而同步缺帧可能与来源时间跨度或到达延迟有关，不能把所有同步缺口都归因于 USB 丢包。
-
-三路同时掉帧时，可在采集电脑上运行 `.\capture.cmd --diagnose-seconds 300`。它按当前配置打开三台相机，持续取帧 5 分钟，关闭预览和视频编码。正常采集和此诊断模式都会每 2 秒在 `outputs/logs/capture.log` 中写入一条 `Capture diagnostics`。可按时间比较故障前后的几条记录。
-
-- `receive_fps` 按应用从 SDK 队列取出彩色帧的时间计算。`fps` 按进入同步缓存的有效时间戳计算。两者出现明显差异时，检查 `timestamp_rejections` 和 `timestamp_regressions` 是否在增加。
-- `sdk_queue_depth` 表示取出一帧时还在 SDK 队列中等待的帧数，`sdk_queue_peak` 是这一数值的历史峰值。当前配置每路可缓冲 6 帧。持续积压时再对照 `source_gaps` 和 `drop_reasons`，区分帧号跳变、同步缺口和写盘队列满。
-- 界面预览约每 67 ms 刷新一次。相机和录制使用 30 Hz，因此判断数据质量应看有效同步帧和占位帧数。
-
-## 验证
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install pytest
-.\.venv\Scripts\python.exe -m pytest tests -q
-```
-
-测试使用合成时间戳和真实 MP4 编码，覆盖 30 Hz 连续匹配、不复用帧、时间差超限、无效时钟、任务序号与防覆盖、停止尾帧及相机丢失。不操作实际硬件。
+`sample_valid=false` 表示占位帧。缺帧时使用上一组画面或黑帧，视频时间轴连续，片段标记为 `incomplete`。
