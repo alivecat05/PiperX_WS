@@ -11,9 +11,9 @@ from calibrate import project
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, required=True, help="Recorded episode directory")
-    parser.add_argument("--intrinsics", type=Path, default=Path("calibration/intrinsics.json"))
-    parser.add_argument("--extrinsics", type=Path, default=Path("calibration/extrinsics.yaml"))
-    parser.add_argument("--output", type=Path, default=Path("calibration/tcp_projection.mp4"))
+    parser.add_argument("--intrinsics", type=Path, default=Path("Calibration/intrinsics.json"))
+    parser.add_argument("--extrinsics", type=Path, default=Path("Calibration/extrinsics.yaml"))
+    parser.add_argument("--output", type=Path, default=Path("Calibration/tcp_projection.mp4"))
     args = parser.parse_args(argv)
     if args.output.resolve() == (args.data/"head.mp4").resolve():
         raise ValueError("Output must differ from the source head.mp4")

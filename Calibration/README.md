@@ -20,12 +20,14 @@ python calibration/read_intrinsics.py --config PiperX_Teleop/config.json
 ## 2. 标定
 
 ```powershell
-python -m pip install -r calibration/requirements.txt
-python calibration/calibrate.py --data path/to/episode_001 --intrinsics calibration/intrinsics.json --board 7 5 0.04 0.03
+python -m pip install -r calibration/requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+python calibration/calibrate.py --data path/to/episode_001 --intrinsics calibration/intrinsics.json --board 8 6 0.045 0.033 --legacy-pattern
 ```
 
 `--board` 依次是横向方格数、纵向方格数、方格边长、marker 边长，长度单位 **米**。
 默认字典 `DICT_4X4_50`，可用 `--dictionary` 修改。
+当前 calib.io 的 8×6 板采用旧版黑白布局，脚本默认启用 `--legacy-pattern`；
+OpenCV 新版默认布局生成的板使用 `--no-legacy-pattern`。两种布局的字典相同，但 ChArUco 角点对应关系不同。
 
 输入是现有录制目录中的 `head.mp4`、`left_wrist.mp4`、`right_wrist.mp4` 和
 `samples.jsonl`。无需导出或转换录制文件。
@@ -33,6 +35,7 @@ python calibration/calibrate.py --data path/to/episode_001 --intrinsics calibrat
 仓库的 `action.csv` 不是同一时刻的实测反馈，不能直接替代。
 
 流程：每五帧检测一次 ChArUco → PnP → Park 手眼 → 固定板位姿融合 → 两个最终矩阵。
+Park 初次求解后，剔除板位姿不一致的标定样本，再用保留样本重估一次 Park；20% 验证样本始终不参与求解。
 保留基本质量检查：图像与位姿时间差 ≤20 ms、重投影 RMS <2 pixel、姿态不退化；
 每臂至少 20 组有效姿态，20% 留出验证；板位姿一致性 RMS ≤15 mm / 3 degree。
 默认参数写在代码里，不再增加一堆命令行开关。

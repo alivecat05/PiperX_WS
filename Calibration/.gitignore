@@ -1,0 +1,6 @@
+sample/
+intrinsics*.json
+extrinsics*.yaml
+*.mp4
+*.csv
+*.npz

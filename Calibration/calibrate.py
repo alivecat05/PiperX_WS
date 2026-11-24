@@ -58,6 +58,8 @@ def residual(poses, reference):
 
 def fuse(poses):
     poses = np.asarray(poses)
+    if len(poses) < 3:
+        raise ValueError("Need at least three board poses; check board dimensions, dictionary and --legacy-pattern")
     reference = min(poses, key=lambda p: np.median(residual(poses, p)[0]/.015 + residual(poses, p)[1]/np.deg2rad(3)))
     distance, angle = residual(poses, reference)
     keep = (distance < .015) & (angle < np.deg2rad(3))
@@ -81,6 +83,15 @@ def solve_base(robot, wrist):
     fixed, keep = fuse(robot[train] @ eye @ wrist[train])
     if keep.mean() < .7:
         raise ValueError("Inconsistent board poses; check input data")
+    retained_robot, retained_wrist = robot[train][keep], wrist[train][keep]
+    motion = Rotation.from_matrix(retained_robot[0, :3, :3].T @ retained_robot[:, :3, :3]).as_rotvec()
+    if np.linalg.svd(motion, compute_uv=False)[1]/np.sqrt(len(motion)) < .1:
+        raise ValueError("Retained poses need rotations about two nonparallel axes")
+    r, t = cv2.calibrateHandEye(list(retained_robot[:, :3, :3]), list(retained_robot[:, :3, 3]),
+                              list(retained_wrist[:, :3, :3]), list(retained_wrist[:, :3, 3]), method=cv2.CALIB_HAND_EYE_PARK)
+    eye = transform(r, t)
+    fixed, _ = fuse(retained_robot @ eye @ retained_wrist)
+    print(f"Park refit: kept {keep.sum()}/{len(keep)} calibration samples")
     distance, angle = residual(robot[test] @ eye @ wrist[test], fixed)
     print(f"held-out board consistency: {np.sqrt(np.mean(distance**2))*1000:.2f} mm, "
           f"{np.rad2deg(np.sqrt(np.mean(angle**2))):.2f} degree")
@@ -95,6 +106,8 @@ def main(argv=None):
     parser.add_argument("--intrinsics", type=Path, required=True)
     parser.add_argument("--board", nargs=4, type=float, required=True, metavar=("NX", "NY", "SQUARE_M", "MARKER_M"))
     parser.add_argument("--dictionary", default="DICT_4X4_50")
+    parser.add_argument("--legacy-pattern", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use the old even-row ChArUco layout (default; --no-legacy-pattern for new boards)")
     parser.add_argument("--output", type=Path, default=Path("calibration/extrinsics.yaml"))
     args = parser.parse_args(argv)
     rows = [json.loads(line) for line in (args.data/"samples.jsonl").read_text(encoding="utf-8-sig").splitlines() if line.strip()]
@@ -102,6 +115,7 @@ def main(argv=None):
     nx, ny, square, marker = args.board
     board = cv2.aruco.CharucoBoard((int(nx), int(ny)), square, marker,
                                   cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, args.dictionary)))
+    board.setLegacyPattern(args.legacy_pattern)
     samples = {name: [] for name in CAMERAS}
     for name in CAMERAS:
         video = cv2.VideoCapture(str(args.data/f"{name}.mp4"))
@@ -132,6 +146,8 @@ def main(argv=None):
     head_board, _ = fuse([pair[1] for pair in samples["head"]])
     result = {}
     for side, key in (("left_wrist", "T_Head_LeftBase"), ("right_wrist", "T_Head_RightBase")):
+        if len(samples[side]) < 20:
+            raise ValueError(f"{side}: need at least 20 valid timestamp-matched board poses, got {len(samples[side])}")
         pairs = np.asarray(samples[side])
         result[key] = head_board @ np.linalg.inv(solve_base(pairs[:, 0], pairs[:, 1]))
     text = "".join(key+":\n"+"".join("  - "+json.dumps(row)+"\n" for row in value.tolist()) for key, value in result.items())
