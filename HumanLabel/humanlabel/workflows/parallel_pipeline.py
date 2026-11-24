@@ -1,12 +1,13 @@
 """Label episodes in place with persistent CUDA workers and a single progress bar."""
 
 import argparse
+import fcntl
 import multiprocessing as mp
 import os
 import shutil
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait
 from concurrent.futures.process import BrokenProcessPool
-from contextlib import closing
+from contextlib import ExitStack, closing
 from pathlib import Path
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 
@@ -14,6 +15,16 @@ from humanlabel.utils.paths import MODEL, ROOT
 
 
 PIPERX_ASSETS = ROOT / "configs/piperx"
+INTERMEDIATE_OUTPUTS = (
+    ("soma.npz", "soma.npz"),
+    ("epose.csv", "epose.csv"),
+    ("wrist_epose.npz", "wrist_epose.npz"),
+    ("pinch.csv", "pinch.csv"),
+    ("quality.csv", "quality.csv"),
+    ("preview.mp4", "preview.mp4"),
+    ("manifest.json", "humanlabel_manifest.json"),
+    ("validation.json", "humanlabel_validation.json"),
+)
 
 
 def find_episodes(root):
@@ -27,23 +38,46 @@ def find_episodes(root):
     )
 
 
-def publish_action(source, destination, *, replace_existing=False):
-    # Stage on the destination filesystem so readers only see complete CSVs.
-    with NamedTemporaryFile(
-        dir=destination.parent, prefix=".action-", delete=False
-    ) as file:
-        staged = Path(file.name)
-    try:
-        shutil.copy(source, staged)
+def publish_action(
+    source, destination, *, replace_existing=False, keep_intermediates=False
+):
+    with ExitStack() as cleanup:
+        episode_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+        cleanup.callback(os.close, episode_fd)
+        fcntl.flock(episode_fd, fcntl.LOCK_EX)
+        if destination.exists() and not replace_existing:
+            return
+
+        outputs = []
+        if keep_intermediates:
+            outputs.extend(
+                (source.parent / name, destination.parent / target)
+                for name, target in INTERMEDIATE_OUTPUTS
+            )
+        outputs.append((source, destination))
+        staged = {}
+        # Finish copying every file before publishing the action as the completion marker.
+        for original, target in outputs:
+            if target.is_dir():
+                raise IsADirectoryError(f"Output path is a directory: {target}")
+            with NamedTemporaryFile(
+                dir=destination.parent, prefix=".action-", delete=False
+            ) as file:
+                temporary = Path(file.name)
+            cleanup.callback(temporary.unlink, missing_ok=True)
+            shutil.copy(original, temporary)
+            staged[target] = temporary
+
+        for target, temporary in staged.items():
+            if target != destination:
+                temporary.replace(target)
         if replace_existing:
-            staged.replace(destination)
+            staged[destination].replace(destination)
         else:
             try:
-                os.link(staged, destination)
+                os.link(staged[destination], destination)
             except FileExistsError:
                 pass
-    finally:
-        staged.unlink(missing_ok=True)
 
 
 def fill_existing_actions(episodes):
@@ -81,7 +115,9 @@ def fill_existing_actions(episodes):
 
 
 class LabelWorker:
-    def __init__(self, workspace, threads, intrinsics, relabel, piperx=None):
+    def __init__(
+        self, workspace, threads, intrinsics, relabel, piperx=None, *, keep_intermediates=False
+    ):
         import cv2
         import torch
 
@@ -94,6 +130,7 @@ class LabelWorker:
         self.workspace = workspace
         self.intrinsics = intrinsics
         self.relabel = relabel
+        self.keep_intermediates = keep_intermediates
         self.contract = capture_contract()
         self.retargeter = None
         if piperx is not None:
@@ -140,13 +177,20 @@ class LabelWorker:
             else:
                 aligned = self.retargeter.actions(final, episode / "timestamps.csv")
             write_csv(final / "action.csv", HEADER, aligned)
-            publish_action(final / "action.csv", destination, replace_existing=self.relabel)
+            publish_action(
+                final / "action.csv",
+                destination,
+                replace_existing=self.relabel,
+                keep_intermediates=self.keep_intermediates,
+            )
 
 
 _worker = None
 
 
-def initialize_worker(devices, workspace, threads, ready_workers, intrinsics, relabel, piperx):
+def initialize_worker(
+    devices, workspace, threads, ready_workers, intrinsics, relabel, piperx, keep_intermediates
+):
     global _worker
 
     device = devices.get()
@@ -159,7 +203,10 @@ def initialize_worker(devices, workspace, threads, ready_workers, intrinsics, re
         os.dup2(quiet.fileno(), 1)
         os.dup2(quiet.fileno(), 2)
     try:
-        _worker = LabelWorker(workspace, threads, intrinsics, relabel, piperx)
+        _worker = LabelWorker(
+            workspace, threads, intrinsics, relabel, piperx,
+            keep_intermediates=keep_intermediates,
+        )
     except Exception as exc:
         (workspace / f"startup-{os.getpid()}.error").write_text(
             f"GPU {device}: {type(exc).__name__}: {exc}"
@@ -174,7 +221,8 @@ def label_episode(episode):
 
 
 def label_parallel(
-    episodes, devices, workers_per_gpu, live, intrinsics=None, *, relabel=False, piperx=None
+    episodes, devices, workers_per_gpu, live, intrinsics=None, *, relabel=False,
+    piperx=None, keep_intermediates=False,
 ):
     from rich.progress import (
         BarColumn,
@@ -208,7 +256,10 @@ def label_parallel(
             max_workers=len(slots),
             mp_context=context,
             initializer=initialize_worker,
-            initargs=(device_queue, workspace, threads, ready_workers, intrinsics, relabel, piperx),
+            initargs=(
+                device_queue, workspace, threads, ready_workers, intrinsics,
+                relabel, piperx, keep_intermediates,
+            ),
         )
         task = None
         try:
@@ -277,6 +328,11 @@ def main(argv=None):
     )
     parser.add_argument("--piperx-urdf", type=Path, help="Override the bundled Piper X arm URDF")
     parser.add_argument("--piperx-gripper-xacro", type=Path, help="Override the bundled gripper Xacro")
+    parser.add_argument(
+        "--keep-intermediates",
+        action="store_true",
+        help="Save SOMA, camera eposes, and preview directly in each episode directory",
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--fill-existing",
@@ -291,6 +347,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.workers_per_gpu < 1:
         parser.error("--workers-per-gpu must be at least 1")
+    if args.fill_existing and args.keep_intermediates:
+        parser.error("--keep-intermediates requires an inference run")
     if args.extrinsics_yaml:
         if not args.intrinsics_json:
             parser.error("--extrinsics-yaml requires --intrinsics-json")
@@ -357,7 +415,7 @@ def main(argv=None):
             )
             label_parallel(
                 pending, devices, args.workers_per_gpu, live, intrinsics,
-                relabel=args.relabel, piperx=piperx,
+                relabel=args.relabel, piperx=piperx, keep_intermediates=args.keep_intermediates,
             )
     except KeyboardInterrupt:
         raise SystemExit(130) from None

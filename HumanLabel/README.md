@@ -36,6 +36,8 @@ python -m humanlabel label-parallel "/path/to/Human_Data" \
 
 默认跳过已有 `action.csv` 的片段，加 `--relabel` 重算。
 
+默认只写 `action.csv`。加 `--keep-intermediates` 会在原 episode 目录同时保留 `soma.npz`、相机系腕部位姿、夹爪距离、质量表和预览。标注的元数据写到 `humanlabel_manifest.json`。
+
 需要相机系腕部位姿或 SOMA 网格时，用 `label` 导出。
 
 ```bash
