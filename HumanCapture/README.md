@@ -15,6 +15,8 @@
 
 `setup.cmd` 创建 `.venv`。按 `discover` 的结果在 `config.json` 中核对相机序列号和 RGB 模式。
 
+界面中的“踏板功能”可选择“录制”或“打断点”。录制模式下，踏板交替开始和停止一段采集；打断点模式下，先用界面按钮开始连续录制，踏板每次踩下依次写入子任务 `start` 和 `end`。断点保存在 episode 目录的 `clip.csv`（`State,Timestamps`），时间为 Unix 秒，与 `timestamps.csv` 的全局同步时间轴一致。踏板功能选择会保存到 `config.json`。
+
 ## 使用方法
 
 ```powershell

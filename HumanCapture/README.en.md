@@ -8,6 +8,8 @@ Records synchronized RGB videos from a head-mounted D555 and two wrist-mounted D
 
 Install Python 3.12 with Tk on Windows. Then set up the environment and discover cameras from `HumanCapture/`.
 
+Choose **Record** or **Breakpoints** in the capture window. In Record mode, pedal presses start and stop episodes. In Breakpoints mode, start continuous recording with the on-screen button; pedal presses then alternate `start` and `end` markers in `clip.csv` inside the episode directory. The `State,Timestamps` CSV stores Unix seconds on the same global synchronized time axis as `timestamps.csv`. The pedal mode is saved in `config.json`.
+
 ```powershell
 .\setup.cmd
 .\capture.cmd discover

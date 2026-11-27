@@ -85,6 +85,11 @@ class Controller:
                     self.recording = True
                     self.last_result = None
                     self.message = "正在录制三路同步视频"
+                elif operation == "clip_toggle":
+                    if not self.recording or self.end_time is not None:
+                        raise ValueError("仅录制期间可以打断点；请先点击开始录制")
+                    state = self.recorder.mark_clip(args.get("timestamp", now))
+                    self.message = f"已记录断点 {state}；下次踩踏记录 {'end' if state == 'start' else 'start'}"
                 elif operation == "record_stop" and self.recording:
                     self.end_time = now if self.end_time is None else self.end_time
                     self.message = "正在对齐末尾帧并保存，请等待"
@@ -136,6 +141,8 @@ class Controller:
         state = {"capture": self.capture.snapshot(), "recording": self.recording and self.end_time is None,
                  "saving": (self.recording and self.end_time is not None) or (self.recorder.busy and not self.recording),
                  "busy": self.recording or self.recorder.busy,
+                 "clip_open": self.recording and self.recorder.clip_open,
+                 "clip_events": self.recorder.clip_events,
                  "ready": not problems and not self.capture.error,
                  "problems": problems, "message": self.message, "frames": self.recorder.count,
                  "dropped": self.recorder.dropped, "drop_reasons": dict(self.recorder.drop_reasons),

@@ -32,12 +32,17 @@ class Pedal:
             self.down = False
 
 
-def save_binding(path, key):
-    """Preserve all device settings when storing only the learned pedal key."""
+def save_settings(path, **settings):
+    """Persist pedal settings without replacing camera or capture configuration."""
     path = Path(path)
     source = path if path.exists() else Path(__file__).resolve().parents[1]/"config.example.json"
     cfg = json.loads(source.read_text(encoding="utf-8-sig"))
-    cfg.setdefault("pedal", {})["key"] = key
+    cfg.setdefault("pedal", {}).update(settings)
     temporary = path.with_name(path.name+".tmp")
     temporary.write_text(json.dumps(cfg, ensure_ascii=False, indent=2)+"\n", encoding="utf-8")
     temporary.replace(path)
+
+
+def save_binding(path, key):
+    """Preserve all device settings when storing only the learned pedal key."""
+    save_settings(path, key=key)

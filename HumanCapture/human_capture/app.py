@@ -46,6 +46,9 @@ def load_config(path):
     pedal = cfg.setdefault("pedal", {})
     pedal.setdefault("key", None)
     pedal.setdefault("debounce_ms", 250)
+    pedal.setdefault("mode", "record")
+    if pedal["mode"] not in ("record", "clip"):
+        raise ValueError("踏板 mode 应为 record（录制）或 clip（打断点）")
     if (pedal["key"] is not None and (not isinstance(pedal["key"], str)
             or not pedal["key"].strip() or len(pedal["key"]) > 64)):
         raise ValueError("踏板 key 应为键名或 null，请使用界面识别踏板")

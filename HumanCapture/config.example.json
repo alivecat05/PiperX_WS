@@ -2,6 +2,7 @@
   "record_hz": 30,
   "pedal": {
     "key": null,
+    "mode": "record",
     "debounce_ms": 250
   },
   "sync": {

@@ -6,9 +6,10 @@ import time
 import cv2
 
 from .core import CAMERAS
-from .pedal import MODIFIERS, Pedal, save_binding
+from .pedal import MODIFIERS, Pedal, save_binding, save_settings
 
 LABELS = {"head": "头部 · D555", "left_wrist": "左腕 · D405i", "right_wrist": "右腕 · D405i"}
+PEDAL_MODES = {"录制": "record", "打断点": "clip"}
 
 
 class Preview:
@@ -20,6 +21,9 @@ class Preview:
         self.learning_pedal = False
         self.pedal_release = None
         self.root = tk.Tk()
+        selected_mode = settings.get("mode", "record")
+        self.pedal_mode = tk.StringVar(master=self.root,
+                                       value="打断点" if selected_mode == "clip" else "录制")
         self.root.title("HumanCapture | 人类三相机同步采集"+(" | 模拟模式" if mock else ""))
         self.root.geometry("1440x800")
         self.root.minsize(1080, 660)
@@ -68,6 +72,11 @@ class Preview:
         self.stop_button = ttk.Button(actions, text="■ 结束录制并保存", style="Stop.TButton",
                                       command=lambda: self.controller.request("record_stop"))
         self.stop_button.pack(side="left", padx=16, ipadx=30, ipady=7)
+        ttk.Label(actions, text="踏板功能").pack(side="left", padx=(0, 6))
+        self.pedal_mode_box = ttk.Combobox(actions, textvariable=self.pedal_mode, state="readonly",
+                                           values=tuple(PEDAL_MODES), width=10)
+        self.pedal_mode_box.pack(side="left")
+        self.pedal_mode_box.bind("<<ComboboxSelected>>", self.on_pedal_mode_change)
         self.learn_button = ttk.Button(actions, text="识别踏板", command=self.learn_pedal)
         self.learn_button.pack(side="left", padx=(8, 12))
         self.pedal_note = tk.StringVar(master=self.root, value=self.pedal_description())
@@ -103,9 +112,28 @@ class Preview:
         for child in widget.winfo_children():
             self._tag_pedal_widgets(child)
 
-    def pedal_description(self):
-        return (f"踏板键：{self.pedal.key} · 踩一下开始 / 再踩结束" if self.pedal.key
+    def pedal_description(self, clip_open=False):
+        mode = "录制（踩下开始 / 再踩停止）" if self.pedal_mode.get() == "录制" else "打断点（依次标记 start / end）"
+        active = " · 子任务进行中，等待 end" if clip_open else ""
+        return (f"踏板键：{self.pedal.key} · 功能：{mode}{active}" if self.pedal.key
                 else "踏板尚未识别 · 点击识别后踩一下")
+
+    def on_pedal_mode_change(self, _event=None):
+        if self.controller.status()["busy"]:
+            current = self.controller.cfg.get("pedal", {}).get("mode", "record")
+            self.pedal_mode.set("打断点" if current == "clip" else "录制")
+            return
+        mode = PEDAL_MODES.get(self.pedal_mode.get())
+        if mode is None:
+            self.pedal_mode.set("录制")
+            return
+        self.controller.cfg.setdefault("pedal", {})["mode"] = mode
+        self.pedal_note.set(self.pedal_description())
+        if self.config_path is not None:
+            try:
+                save_settings(self.config_path, mode=mode)
+            except (OSError, ValueError) as error:
+                self.pedal_note.set(f"本次已切换踏板功能；保存配置失败：{error}")
 
     def learn_pedal(self):
         if self.controller.status()["busy"]:
@@ -139,8 +167,12 @@ class Preview:
         if self.pedal_release is not None:
             self.root.after_cancel(self.pedal_release)
             self.pedal_release = None
-        if self.pedal.press(key, time.perf_counter()):
-            self.controller.request("record_toggle", selection=self.selection())
+        pressed_at = time.perf_counter()
+        if self.pedal.press(key, pressed_at):
+            if self.pedal_mode.get() == "打断点":
+                self.controller.request("clip_toggle", timestamp=pressed_at)
+            else:
+                self.controller.request("record_toggle", selection=self.selection(), timestamp=pressed_at)
         return "break"
 
     def on_pedal_release(self, event):
@@ -212,6 +244,9 @@ class Preview:
         self.start_button.state(["!disabled"] if status["ready"] and not status["busy"] else ["disabled"])
         self.stop_button.state(["!disabled"] if status["recording"] else ["disabled"])
         self.learn_button.state(["disabled"] if status["busy"] else ["!disabled"])
+        self.pedal_mode_box.state(["disabled"] if status["busy"] else ["!disabled"])
+        if not self.learning_pedal:
+            self.pedal_note.set(self.pedal_description(status.get("clip_open", False)))
         for name in CAMERAS:
             camera = status["cameras"][name]
             clock = {"global_time": "SDK 全局时钟", "system_time": "SDK 系统时钟",

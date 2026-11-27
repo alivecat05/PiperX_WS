@@ -27,6 +27,8 @@ class Recorder:
         self.drop_reasons = Counter()
         self.writes = History()
         self.camera_diagnostics = {}
+        self.clip_open = False
+        self.clip_events = 0
 
     @property
     def busy(self):
@@ -81,6 +83,10 @@ class Recorder:
         wall = time.time()
         self.unix_offset = wall-(before+time.perf_counter())/2
         self.end_time = None
+        self.clip_open = False
+        self.clip_events = 0
+        with (self.path/"clip.csv").open("w", encoding="utf-8", newline="") as clips:
+            csv.writer(clips).writerow(["State", "Timestamps"])
         self.complete, self.reason = True, "operator_stop"
         # Bound retained full-resolution RGB images by bytes, rather than 60 groups
         # (~516 MB with the deployed profiles), in addition to camera histories.
@@ -117,6 +123,22 @@ class Recorder:
         self.last_grid, self.reported_missing = grid_index, 0
         self.queue_high_watermark = max(self.queue_high_watermark, self.queue.qsize())
         return True
+
+    def mark_clip(self, timestamp):
+        """Record a pedal edge on the same Unix-seconds clock as timestamps.csv."""
+        if not self.active or self.end_time is not None:
+            raise ValueError("仅录制期间可以打断点")
+        if not self.start_time <= timestamp:
+            raise ValueError("断点时间不能早于本次录制开始")
+        state = "end" if self.clip_open else "start"
+        # Each press is persisted immediately, even if the process later exits abruptly.
+        with (self.path/"clip.csv").open("a", encoding="utf-8", newline="") as clips:
+            csv.writer(clips).writerow([state, f"{timestamp+self.unix_offset:.9f}"])
+            clips.flush()
+            os.fsync(clips.fileno())
+        self.clip_open = not self.clip_open
+        self.clip_events += 1
+        return state
 
     def stop(self, reason="operator_stop", complete=True, end_time=None):
         self.reason, self.complete, self.end_time = reason, complete, end_time
@@ -250,6 +272,8 @@ class Recorder:
             "start_unix_s": self.start_time+self.unix_offset,
             "end_unix_s": self.end_time+self.unix_offset if self.end_time is not None else None,
             "videos": {n: f"{n}.mp4" for n in CAMERAS}, "timestamp_file": "timestamps.csv",
+            "clip_file": "clip.csv",
+            "clip_timestamps": "pedal press time in Unix seconds; same clock as timestamps.csv timestamp_unix_s",
             "frame_alignment": "MP4 frame N = timestamps.csv data row N = samples.jsonl row N (zero-based)",
             "video_timeline": "wall-time CFR grid; gaps hold previous images (black before first frame); sample_valid=false; source timestamps unchanged",
             "synchronization": "SDK global/system time mapped to a common monotonic clock; software alignment",
