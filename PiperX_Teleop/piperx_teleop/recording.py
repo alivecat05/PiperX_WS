@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 
 from .core import ACTION_SEMANTICS, CAMERAS, VECTOR_NAMES, History
+from .ffmpeg_writer import FFmpegWriter
 from .video_timeline import VideoTimeline, grid_count
 
 
@@ -170,13 +171,8 @@ class Recorder:
             for name in CAMERAS:
                 camera = self.config_snapshot["cameras"][name]
                 size = camera["width"], camera["height"]
-                if any(d <= 0 or d % 2 for d in size):
-                    raise ValueError("MP4 frame dimensions must be positive even numbers")
-                video = cv2.VideoWriter(str(self.path / f"{name}.mp4"),
-                    cv2.VideoWriter_fourcc(*"mp4v"), self.config_snapshot["record_hz"], size)
-                videos[name] = video
-                if not video.isOpened():
-                    raise OSError(f"Could not open {name}.mp4 for recording")
+                videos[name] = FFmpegWriter(self.path / f"{name}.mp4",
+                                           self.config_snapshot["record_hz"], size)
             self._manifest("recording", "")
             with ((self.path / "samples.jsonl").open("w", encoding="utf-8") as stream,
                   (self.path / "action.csv").open("w", encoding="utf-8", newline="") as action_file):
@@ -211,7 +207,7 @@ class Recorder:
                 try:
                     video.release()  # MP4 headers must be finalized before marking the episode complete.
                 except Exception as error:
-                    self.error = f"Could not finalize MP4: {error}"
+                    self.error = self.error or f"Could not finalize MP4: {error}"
         try:
             if not self.error:
                 self._check_videos()
@@ -279,6 +275,8 @@ class Recorder:
             "end_unix_s": self.end_time + self.unix_offset if self.end_time is not None else None,
             "timestamp_clock": "Unix seconds; fixed mapping from monotonic clock at episode start",
             "videos": {name: f"{name}.mp4" for name in CAMERAS},
+            "video_encoding": {"backend": "ffmpeg", "codec": "libx264",
+                               "pixel_format": "yuv420p", "preset": "ultrafast", "crf": 18},
             "action_file": "action.csv",
             "frame_alignment": "MP4 frame N = action.csv data row N = samples.jsonl row N (zero-based)",
             "video_timeline": "wall-time CFR grid; gaps hold previous images (black before first frame); sample_valid=false; source timestamps unchanged",

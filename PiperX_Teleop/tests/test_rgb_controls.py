@@ -1,8 +1,12 @@
 """Sensor setup must exclude depth and freeze measured AE values, including reconnects."""
+from contextlib import nullcontext
+from multiprocessing import get_context
+from threading import Event
 from types import SimpleNamespace as NS
 
 import pytest
 
+import piperx_teleop.cameras as module
 from piperx_teleop.rgb_controls import exposure_sensors, lock_exposure, prepare_rgb
 from test_pipeline import cfg
 
@@ -117,25 +121,38 @@ def test_d405_without_metadata_still_caps_default_exposure_for_requested_fps():
     frame = NS(supports_frame_metadata=lambda _: False)
     assert lock_exposure([sensor], RS, frame=frame, fps=30) == [{"exposure": 30000., "gain": 16.}]
 
-def test_camera_worker_retries_instead_of_permanently_exiting(cfg, monkeypatch):
-    from piperx_teleop.cameras import Cameras
-    cameras = Cameras(cfg)
+@pytest.mark.parametrize("name", ["head", "left_wrist"])
+def test_camera_worker_retries_instead_of_permanently_exiting(cfg, monkeypatch, name):
+    camera_cfg = cfg["cameras"][name]
+    context = object()
+    stop = Event()
+    messages = []
     attempts = []
-    def stream(name):
-        attempts.append(name)
+    device_visible = iter([False, True])
+    delays = []
+    def stream(self, active_context):
+        attempts.append(active_context)
         if len(attempts) == 1:
             raise RuntimeError("temporary SDK disconnect")
-    monkeypatch.setattr(cameras, "_stream", stream)
-    monkeypatch.setattr(cameras.stop_event, "wait", lambda _: False)
-    cameras._worker("head")
-    assert attempts == ["head", "head"]
-    assert cameras.diagnostics["head"]["reconnects"] == 1
+    monkeypatch.setattr(module._RealSenseCapture, "stream", stream)
+    monkeypatch.setattr(module._RealSenseCapture, "device_present", lambda *_: next(device_visible))
+    monkeypatch.setattr(module, "rs_context", lambda _: context)
+    monkeypatch.setattr(module.signal, "signal", lambda *_: None)
+    monkeypatch.setattr(stop, "wait", delays.append)
+    buffer = bytearray(camera_cfg["height"] * camera_cfg["width"] * 3)
+    sender = nullcontext()
+    sender.send = messages.append
+    module._capture_camera(camera_cfg, cfg["realsense"], stop, buffer, get_context("spawn").Semaphore(1), sender)
+    assert attempts == [context, context]
+    if name == "left_wrist":
+        assert delays == [1, .5]
+    _, _, stats, error = messages[0]
+    assert stats["reconnects"] == 1 and "temporary SDK disconnect" in error
 
 
 def test_camera_stream_locks_only_after_warmup_and_restores_on_reconnect(cfg, monkeypatch):
     import sys
     import numpy as np
-    import piperx_teleop.cameras as module
     color, depth = Sensor(), Sensor("depth")
     clock = [100.]
     config_calls = []
@@ -143,8 +160,14 @@ def test_camera_stream_locks_only_after_warmup_and_restores_on_reconnect(cfg, mo
     device = NS(query_sensors=lambda: [color, depth], get_info=lambda _: "D555")
     stream_profile.get_device = lambda: device
     original_start = color.values.copy()
-    camera = module.Cameras(cfg)
-    name = "head"
+    camera_cfg = cfg["cameras"]["head"]
+    buffer = bytearray(camera_cfg["height"] * camera_cfg["width"] * 3)
+    available = get_context("spawn").Semaphore(1)
+    received = []
+    def receive(message):
+        received.append(message)
+        available.release()
+    capture = module._RealSenseCapture(camera_cfg, Event(), buffer, available, NS(send=receive))
     def run_stream():
         index = [0]
         def next_frame(_):
@@ -153,9 +176,9 @@ def test_camera_stream_locks_only_after_warmup_and_restores_on_reconnect(cfg, mo
             frame = NS(get_frame_number=lambda: index[0],
                 get_frame_timestamp_domain=lambda: "global_time",
                 get_timestamp=lambda: clock[0]*1000,
-                get_data=lambda: np.zeros((48, 64, 3), np.uint8))
+                get_data=lambda: np.zeros((camera_cfg["height"], camera_cfg["width"], 3), np.uint8))
             if index[0] >= 5:
-                camera.stop_event.set()
+                capture.stop.set()
             return True, NS(get_color_frame=lambda: frame)
         pipe = NS(start=lambda _: stream_profile, stop=lambda: None,
                   try_wait_for_frames=next_frame)
@@ -167,13 +190,13 @@ def test_camera_stream_locks_only_after_warmup_and_restores_on_reconnect(cfg, mo
             camera_info=NS(name="name"), pipeline=lambda _: pipe, config=lambda: config)
         monkeypatch.setitem(sys.modules, "pyrealsense2", fake_rs)
         monkeypatch.setattr(module, "time", NS(perf_counter=lambda: clock[0], time=lambda: clock[0]))
-        camera.stop_event.clear()
-        camera._stream(name)
+        capture.stop.clear()
+        capture.stream(None)
     run_stream()
-    assert camera.exposure_settings[name] == [{"exposure": original_start["exposure"], "gain": original_start["gain"]}]
-    assert camera.histories[name].latest().value["exposure_locked"]
-    assert camera.histories[name].latest().value["depth_enabled"] is False
-    assert camera.diagnostics[name]["received_frames"] == 2  # First 2 seconds are warmup.
+    assert capture.exposure_settings == [{"exposure": original_start["exposure"], "gain": original_start["gain"]}]
+    _, frame, stats, error = received[-1]
+    assert error is None and frame["exposure_locked"] and frame["depth_enabled"] is False
+    assert stats["received_frames"] == 2  # First 2 seconds are warmup.
     color.calls.clear()
     color.values.update(exposure=444., gain=5.)
     run_stream()
@@ -182,3 +205,18 @@ def test_camera_stream_locks_only_after_warmup_and_restores_on_reconnect(cfg, mo
     assert color.values["gain"] == original_start["gain"]
     assert config_calls == ["disable_all", "color", "disable_all", "color"]
     assert depth.calls == []
+
+
+def test_d405_frame_wait_uses_polling_and_respects_timeout(cfg, monkeypatch):
+    cfg = cfg["cameras"]["left_wrist"]
+    buffer = bytearray(cfg["height"] * cfg["width"] * 3)
+    clock = [0.]
+    stop = NS(is_set=lambda: False, wait=lambda delay: clock.__setitem__(0, clock[0] + delay))
+    monkeypatch.setattr(module, "time", NS(perf_counter=lambda: clock[0]))
+    capture = module._RealSenseCapture(cfg, stop, buffer, None, None)
+    frames = object()
+    pipe = NS(poll_for_frames=lambda: frames if clock[0] >= .02 else None)
+    assert capture.wait_for_frames(pipe) == (True, frames)
+    pipe.poll_for_frames = lambda: None
+    assert capture.wait_for_frames(pipe) == (False, None)
+    assert clock[0] == pytest.approx(.52)

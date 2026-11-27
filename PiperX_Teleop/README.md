@@ -57,6 +57,12 @@
 
 第一条使用模拟设备。第二条检查 Quest 和真实相机输入，机器人使用模拟反馈。[实机前检查和验证记录](docs/validation.md)
 
+### 相机与录制
+
+每路相机在独立进程采集和重连，避免相机 SDK 的阻塞影响 Quest 与机器人反馈。D405 连续 1 秒收不到帧时启动重连，并等待相机重新出现。FFmpeg 在程序启动时完成探测，减少录制开始时的写入队列积压。录制视频使用 H.264 MP4。已有环境可执行 `.\.conda\envs\teleop\python.exe -m pip install -e .` 安装新增依赖。
+
+故障详情见 `outputs/logs/teleop.log`。若控制器仍显示急停并需要清除故障，先退出遥操并支撑好双臂，再运行 `.\teleop.cmd recover --supported`。该命令会断开电机动力。
+
 ## 数据格式
 
 `outputs/episodes/<任务>/episode_001/` 保存三路 30 FPS MP4、`action.csv`、`samples.jsonl` 和 `manifest.json`。三路视频和数据逐帧对应。

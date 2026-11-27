@@ -130,10 +130,9 @@ def test_missing_grid_never_marks_lower_rate_video_complete(cfg):
 
 
 def test_encoder_failure_cannot_commit_complete_episode(cfg, monkeypatch):
-    class FailedWriter:
-        def isOpened(self): return False
-        def release(self): pass
-    monkeypatch.setattr(cv2, "VideoWriter", lambda *_: FailedWriter())
+    def fail(*args):
+        raise OSError("Could not open FFmpeg encoder")
+    monkeypatch.setattr("piperx_teleop.recording.FFmpegWriter", fail)
     writer = Recorder(cfg["output"], cfg, mock=True)
     writer.start(10.)
     assert writer.wait(5)

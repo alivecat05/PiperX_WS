@@ -20,6 +20,7 @@ from .controller import Controller
 from .core import ARMS, CAMERAS
 from .preview import Preview
 from .robot import MockPiperX, PiperX, RECOVERABLE_STATUSES
+from .ffmpeg_writer import get_ffmpeg_exe
 
 
 class ConsoleFormatter(logging.Formatter):
@@ -307,6 +308,11 @@ async def run(args, cfg):
             run_adb(adb_args, "reverse", f"tcp:{args.port}", f"tcp:{args.port}")
             usb_adb = adb_args
         cameras.start()
+        # imageio probes the binary on first use. Finish before recordings can fill the frame queue.
+        try:
+            await asyncio.to_thread(get_ffmpeg_exe)
+        except RuntimeError as error:
+            logging.getLogger(__name__).warning("FFmpeg unavailable at startup: %s", error)
         for side in ARMS:
             robots[side] = (MockPiperX if simulated_robots else PiperX)(cfg["arms"][side])
         controller = Controller(cfg, robots, cameras, simulated_robots, args.config)

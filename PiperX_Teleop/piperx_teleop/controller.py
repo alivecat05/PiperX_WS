@@ -17,7 +17,7 @@ from .feedback import Feedback
 from .robot import RecoverableRobotError, validate_vector
 
 LOG = logging.getLogger(__name__)
-RUNTIME_REVISION = "2026-11-09-freeze-filtered-target"
+RUNTIME_REVISION = "2026-11-27-d405-capture-recovery"
 
 
 class Controller:
@@ -232,6 +232,15 @@ class Controller:
         with self.input_lock:
             self.input_events.clear()
             self.event_ack = self.last_event
+        checked_at = time.perf_counter()
+        feedback_ages = {}
+        for side, history in self.states.items():
+            sample = history.latest()
+            stamps = sample.value.get("source_timestamps", {}) if sample else {}
+            feedback_ages[side] = {name: round((checked_at-stamp)*1000, 1)
+                                   for name, stamp in stamps.items()}
+        LOG.info("Fault diagnostics: last CAN feedback ages (ms)=%s, camera errors=%s, electronic stop requested=%s",
+                 feedback_ages, dict(self.cameras.errors), self.commands_started)
         LOG.error(message)
 
     def _read(self, now):
@@ -1009,11 +1018,14 @@ class Controller:
         deadline = last
         while not self.stop_event.is_set():
             now = time.perf_counter()
+            interval = now-last
             try:
-                self.tick(now, now-last)
+                self.tick(now, interval)
             except Exception as error:
                 LOG.info("Control fault details", exc_info=True)
                 self._fault(str(error))
+            if interval > self.cfg["feedback_timeout_s"]:
+                LOG.warning("Control loop gap: %.0f ms", interval*1000)
             last = now
             deadline += 1 / self.cfg["control_hz"]
             remaining = deadline - time.perf_counter()
